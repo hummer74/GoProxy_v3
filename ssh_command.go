@@ -21,10 +21,11 @@ func buildSSHCommand(hosts []HostConfig, keyPath string) []string {
 	configContent := fmt.Sprintf(`Host *
     AddressFamily inet
     BatchMode yes
-    ConnectTimeout 15
-    ServerAliveInterval 30
-    ServerAliveCountMax 3
-    TCPKeepAlive yes
+    ControlMaster auto
+    TCPKeepAlive no
+    ControlPersist 1m
+    ServerAliveInterval 5
+    ServerAliveCountMax 6
     StrictHostKeyChecking accept-new
     UserKnownHostsFile "%s"
     ExitOnForwardFailure yes

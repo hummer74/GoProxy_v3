@@ -174,11 +174,11 @@ func buildTestSSHCommand(host HostConfig, workDir string) []string {
 	cmd = append(cmd,
 		"-o", "BatchMode=yes", // Не запрашивать пароль
 		"-o", "ConnectTimeout=5", // Таймаут подключения 5 секунд для медленных сетей
-		"-o", "ServerAliveInterval=2", // Проверка активности
-		"-o", "ServerAliveCountMax=2", // Быстро отключаться если нет ответа
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "TCPKeepAlive=yes",
+		"-o", "ServerAliveInterval=5", // Проверка активности
+		"-o", "ServerAliveCountMax=6", // Быстро отключаться если нет ответа
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "UserKnownHostsFile=nul",
+		"-o", "TCPKeepAlive=no",
 		"-o", "LogLevel=ERROR", // Только ошибки
 	)
 
