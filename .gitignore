@@ -1,0 +1,16 @@
+*.log
+x_*.*
+*.pac
+*.pid
+*.ini
+*ini.*
+.ssh/conf*
+.ssh/conf*.*
+.ssh/opossum*
+.ssh/*_key
+.ssh/*.pub
+.ssh/*_pass
+.ssh/goproxy_*
+.ssh/x_*.*
+.ssh/geoip_ru.txt
+.ssh/proxy_pac.txt
