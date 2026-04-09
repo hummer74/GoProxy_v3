@@ -213,18 +213,23 @@ func createTrayMenu() {
                 debugLog("MENU", "Background status check completed for %d hosts", len(groupHosts))
             })
 
-            // Add host items
+            // Add host items (direct first, then reverse with separator)
             for hi, host := range group.Hosts {
                 debugLog("MENU", "  Adding menu item[%d]: %q (group=%q)", hi, host.Name, host.Group)
+
+                // Add separator before first reverse host in group
+                if isReverseHost(host) && (hi == 0 || !isReverseHost(group.Hosts[hi-1])) {
+                    systray.AddSeparator()
+                    debugLog("MENU", "    Separator before reverse hosts")
+                }
+
                 paddedName := padRight(host.Name, maxLength)
                 menuTitle := fmt.Sprintf("○ %s", paddedName) // Empty circle for checking
 
-                var tooltip string
+                tooltip := fmt.Sprintf("Checking SSH connection to %s...", host.Name)
                 if isReverseHost(host) {
-                    tooltip = fmt.Sprintf("Reverse: %s (via %s)...", host.Name, host.ProxyJump)
                     debugLog("MENU", "    → Reverse host (ProxyJump=%q)", host.ProxyJump)
                 } else {
-                    tooltip = fmt.Sprintf("Checking SSH connection to %s...", host.Name)
                     debugLog("MENU", "    → Direct host")
                 }
 
@@ -636,13 +641,7 @@ func updateHostStatusInMenu(hosts []HostConfig, initialCheck bool) {
             continue
         }
 
-        // Build tooltip with ProxyJump info for reverse hosts
-        var tooltip string
-        if isReverseHost(host) {
-            tooltip = fmt.Sprintf("%s: %s (via %s)", host.Name, statusText(resultMap[host.Name]), host.ProxyJump)
-        } else {
-            tooltip = fmt.Sprintf("%s: %s", host.Name, statusText(resultMap[host.Name]))
-        }
+        tooltip := fmt.Sprintf("%s: %s", host.Name, statusText(resultMap[host.Name]))
 
         if resultMap[host.Name] {
             menuItem.SetTitle(fmt.Sprintf("%s %s", GreenCircle, paddedName))
@@ -684,16 +683,12 @@ func updateMenuState() {
     isChain := false
     var chainParts []string
     chainHostSet := make(map[string]bool)
-    lastChainHost := ""
     if connState.IsActive() && currentHostVal != "" {
         if strings.Contains(currentHostVal, " -> ") {
             isChain = true
             chainParts = strings.Split(currentHostVal, " -> ")
             for _, h := range chainParts {
                 chainHostSet[h] = true
-            }
-            if len(chainParts) > 0 {
-                lastChainHost = chainParts[len(chainParts)-1]
             }
         }
     }
@@ -702,9 +697,18 @@ func updateMenuState() {
     if isChain && chainSectionBottomSep != nil {
         chainSectionBottomSep.Show()
 
-        // Find max name length in chain for padding
+        // Check if this is a reverse connection (2 hops, last has ProxyJump=first)
+        displayChainParts := chainParts
+        if len(chainParts) == 2 {
+            lastHost := chainParts[len(chainParts)-1]
+            if hc := findHostByName(allMenuHosts, lastHost); hc != nil && hc.ProxyJump == chainParts[0] {
+                displayChainParts = chainParts[1:2] // Show only the target host
+            }
+        }
+
+        // Find max name length for padding
         chainMaxLength := 0
-        for _, h := range chainParts {
+        for _, h := range displayChainParts {
             if len(h) > chainMaxLength {
                 chainMaxLength = len(h)
             }
@@ -715,38 +719,21 @@ func updateMenuState() {
             if item == nil {
                 continue
             }
-            if i < len(chainParts) {
-                hostName := chainParts[i]
-                pos := i + 1
-                posStr := fmt.Sprintf("[%d]", pos)
+            if i < len(displayChainParts) {
+                hostName := displayChainParts[i]
                 paddedName := padRight(hostName, chainMaxLength)
 
-                if hostName == lastChainHost {
-                    // Exit host: ✓ ● [N] alias (HH:MM)
-                    item.Check()
-                    item.Enable()
-                    startedTime := connState.GetStartTime()
-                    if !startedTime.IsZero() {
-                        duration := time.Since(startedTime)
-                        durationStr := formatDuration(duration)
-                        item.SetTitle(fmt.Sprintf("%s %s %s (%s)", GreenCircle, posStr, paddedName, durationStr))
-                        item.SetTooltip(fmt.Sprintf("Chain exit: %s\nConnected for: %s", currentHostVal, durationStr))
-                    } else {
-                        item.SetTitle(fmt.Sprintf("%s %s %s", GreenCircle, posStr, paddedName))
-                        item.SetTooltip(fmt.Sprintf("Chain exit: %s", currentHostVal))
-                    }
-                } else if pos == 1 {
-                    // Entry host: ✓ ● [1] alias
-                    item.Check()
-                    item.Enable()
-                    item.SetTitle(fmt.Sprintf("%s %s %s", RedCircle, posStr, paddedName))
-                    item.SetTooltip(fmt.Sprintf("Chain entry → %s", currentHostVal))
+                item.Check()
+                item.Enable()
+                startedTime := connState.GetStartTime()
+                if !startedTime.IsZero() {
+                    duration := time.Since(startedTime)
+                    durationStr := formatDuration(duration)
+                    item.SetTitle(fmt.Sprintf("%s (%s)", paddedName, durationStr))
+                    item.SetTooltip(fmt.Sprintf("Connected: %s\nDuration: %s", currentHostVal, durationStr))
                 } else {
-                    // Intermediate host: ☐ → [N] alias
-                    item.Uncheck()
-                    item.Enable()
-                    item.SetTitle(fmt.Sprintf("%s %s %s", CurrentArrow, posStr, paddedName))
-                    item.SetTooltip(fmt.Sprintf("Chain hop %d → %s", pos, currentHostVal))
+                    item.SetTitle(fmt.Sprintf("%s", paddedName))
+                    item.SetTooltip(fmt.Sprintf("Connected: %s", currentHostVal))
                 }
                 item.Show()
             } else {
@@ -830,15 +817,13 @@ func updateMenuState() {
                 var statusIcon, tooltip string
 
                 if isReverseHostByName(hostName) {
-                    // Reverse host — include ProxyJump info in tooltip
-                    pjName := getProxyJumpName(hostName)
                     if status {
                         statusIcon = GreenCircle
-                        tooltip = fmt.Sprintf("%s: %s (via %s)", hostName, "SSH connection available", pjName)
+                        tooltip = fmt.Sprintf("%s: SSH connection available", hostName)
                         menuItem.Enable()
                     } else {
                         statusIcon = RedCircle
-                        tooltip = fmt.Sprintf("%s: %s (via %s)", hostName, "SSH connection failed", pjName)
+                        tooltip = fmt.Sprintf("%s: SSH connection failed", hostName)
                         menuItem.Disable()
                     }
                 } else {

@@ -117,12 +117,12 @@ const (
 
 // Unicode characters for tray menu
 const (
-    GreenCircle  = "●" // U+25CF
-    RedCircle    = "○" // U+25CB
-    CurrentArrow = "→" // U+2192
-    CheckMark    = "✓" // U+2713
-    ChainArrow   = "▸" // U+25B8
-    ClearX       = "✕" // U+2715
+    GreenCircle  = "✅" // U+2705 White Heavy Check Mark
+    RedCircle    = "❌" // U+274C Cross Mark
+    CurrentArrow = "▶" // U+25B6 Black Right-Pointing Triangle
+    CheckMark    = "✓" // U+2713 Check Mark
+    ChainArrow   = "▶" // U+25B6 Black Right-Pointing Triangle
+    ClearX       = "⬜" // U+2B1C White Large Square
 )
 
 // Circled number characters for chain position display (1-10)

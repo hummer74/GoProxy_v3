@@ -41,6 +41,9 @@ func buildSSHCommand(hosts []HostConfig, keyPath string) []string {
     ExitOnForwardFailure yes
     LogLevel INFO
     RequestTTY no
+    TCPSndBuf 4194304
+    TCPRcvBuf 4194304
+    TCPRcvBufPoll yes
 
 `, filepath.ToSlash(knownHostsPath))
 
