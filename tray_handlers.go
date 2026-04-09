@@ -14,6 +14,7 @@ import (
 
 // handleHostClick handles clicks on host menu items
 func handleHostClick(host HostConfig) {
+    debugLog("HANDLER", "Host click: %s", host.Name)
     // Check if we're already connected to this host
     if connState.IsActive() && connState.GetHost() == host.Name {
         return
@@ -57,12 +58,91 @@ func handleHostClick(host HostConfig) {
     }
 }
 
+// handleReverseHostClick handles clicks on reverse tunnel hosts (hosts with ProxyJump).
+// Automatically resolves the ProxyJump chain and connects immediately in one click.
+func handleReverseHostClick(host HostConfig) {
+    debugLog("HANDLER", "Reverse host click: %s (ProxyJump: %s)", host.Name, host.ProxyJump)
+    // Check if already connected to this host
+    currentHostVal := connState.GetHost()
+    if connState.IsActive() && strings.Contains(currentHostVal, " -> ") {
+        chainParts := strings.Split(currentHostVal, " -> ")
+        for _, part := range chainParts {
+            if part == host.Name {
+                return // Already connected via this host
+            }
+        }
+    }
+    if connState.IsActive() && currentHostVal == host.Name {
+        return
+    }
+
+    // Check availability (reverse hosts check via their ProxyJump target)
+    if status, exists := hostStatusCache.Get(host.Name); exists && !status {
+        logTunnelEvent("WARN", host.Name, "Attempted to connect to unavailable reverse host")
+        return
+    }
+
+    // Resolve ProxyJump target from parsed hosts
+    var jumper *HostConfig
+    for i := range allMenuHosts {
+        if allMenuHosts[i].Name == host.ProxyJump {
+            jumper = &allMenuHosts[i]
+            break
+        }
+    }
+
+    if jumper == nil {
+        // ProxyJump target not found in config — fall back to single host connection
+        logTunnelEvent("WARN", host.Name,
+            fmt.Sprintf("ProxyJump target '%s' not found, falling back to direct connection", host.ProxyJump))
+        handleHostClick(host)
+        return
+    }
+
+    // Build auto-resolved chain: [jumper, target]
+    chain := []HostConfig{*jumper, host}
+    chainDisplay := fmt.Sprintf("%s -> %s", jumper.Name, host.Name)
+
+    logTunnelEvent("INFO", chainDisplay,
+        fmt.Sprintf("Auto-resolved reverse host connection: %s (via ProxyJump %s)", host.Name, host.ProxyJump))
+
+    // Show connecting state in tray
+    iconData := loadIconData(color.RGBA{255, 255, 0, 255})
+    if iconData != nil {
+        systray.SetIcon(iconData)
+    }
+    systray.SetTitle(fmt.Sprintf("Connecting to %s...", host.Name))
+    systray.SetTooltip(fmt.Sprintf("Connecting via %s → %s...", jumper.Name, host.Name))
+
+    // Connect as chain with ProxyJump auto-resolution
+    result := establishConnection(ConnectOptions{
+        Hosts:              chain,
+        IsChain:            true,
+        OriginalHost:       chainDisplay,
+        StopMonitoring:     true,
+        KillExistingTunnel: true,
+        EnableSystemProxy:  true,
+        SaveLastHost:       true,
+        StartMonitoring:    true,
+        UpdateTray:         true,
+        DisplayAlias:       host.Name,                                          // Show reverse host name in tray
+        DisplayTooltip:     fmt.Sprintf("via %s → %s:%s", jumper.Name, host.HostName, host.Port),
+    })
+
+    if result == nil {
+        logTunnelEvent("ERROR", chainDisplay, "Reverse host connection failed")
+        systray.SetTitle("Connection failed")
+        systray.SetTooltip(fmt.Sprintf("Failed to connect to %s via %s", host.Name, jumper.Name))
+    }
+}
+
 // Function hooks for tray/UI operations (used in tests and by monitoring)
 var updateTrayStatusOnlineFn = updateTrayStatusOnline
 var updateMenuStateFn = updateMenuState
 
 // handleSmartFailover выполняет умное переключение на самый быстрый доступный хост
 func handleSmartFailover(currentState *ProxyState) bool {
+    debugLog("HANDLER", "Smart failover from: %s", currentState.Host)
     if !Config.General.SmartFailover || currentState.IsChain {
         return false
     }
@@ -82,10 +162,10 @@ func handleSmartFailover(currentState *ProxyState) bool {
         }
     }
 
-    // Исключаем текущий хост из поиска
+    // Исключаем текущий хост и реверсивные хосты (они идут через джампер)
     var availableHosts []HostConfig
     for _, host := range firstGroupHosts {
-        if host.Name != currentState.OriginalHost && host.Name != currentState.Host {
+        if host.Name != currentState.OriginalHost && host.Name != currentState.Host && !isReverseHost(host) {
             availableHosts = append(availableHosts, host)
         }
     }
@@ -197,6 +277,7 @@ func checkAndReturnToOriginalHost(currentState *ProxyState) bool {
 // handleConnectChain handles the "Connect Chain" button click
 func handleConnectChain() {
     chain := getChainBuilderCopy()
+    debugLog("HANDLER", "Connect chain: %d hosts", len(chain))
     if len(chain) == 0 {
         return
     }
@@ -261,6 +342,7 @@ func handleClearChain() {
 
 // handleKillProxy handles the Kill Proxy menu item
 func handleKillProxy() {
+    debugLog("HANDLER", "Kill proxy")
     logTunnelEvent("INFO", connState.GetHost(), "User requested to kill proxy")
 
     stopMonitoring()
@@ -280,6 +362,7 @@ func handleKillProxy() {
 
 // handleExit handles the Exit menu item - performs full cleanup using stop mode
 func handleExit() {
+    debugLog("HANDLER", "Exit")
     logTunnelEvent("INFO", connState.GetHost(), "User requested exit")
 
     stopMonitoring()

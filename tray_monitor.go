@@ -149,6 +149,7 @@ func (mc *monitoringConfig) handleNormalState(state *ProxyState) {
         mc.lastReconnectAttempt = time.Time{}
         mc.reconnectAttempts = 0
         connState.SetActive(false)
+        debugLog("MONITOR", "Tunnel lost, isReconnecting=true, smartFailover=%v", Config.General.SmartFailover)
         logTunnelEvent("ERROR", state.Host, "Tunnel lost connection")
         updateMenuState()
 
@@ -225,6 +226,7 @@ func (mc *monitoringConfig) handleReconnectionState(state *ProxyState) {
         }
         mc.lastReconnectAttempt = time.Now()
         mc.reconnectAttempts++
+        debugLog("MONITOR", "Reconnect attempt %d", mc.reconnectAttempts)
 
         remainingTime := mc.maxReconnectTime - time.Since(mc.reconnectStartTime)
         logTunnelEvent("INFO", state.Host,
@@ -256,6 +258,8 @@ func (mc *monitoringConfig) handleReconnectionState(state *ProxyState) {
 
 // startMonitoring starts a new monitoring loop for the current connection.
 func startMonitoring(state *ProxyState) {
+        debugLog("MONITOR", "Starting monitoring for: %s", state.Host)
+
         monitoringMutex.Lock()
         if monitoringActive {
                 monitoringMutex.Unlock()
@@ -317,6 +321,8 @@ func startMonitoring(state *ProxyState) {
 
 // stopMonitoring stops the current monitoring loop.
 func stopMonitoring() {
+        debugLog("MONITOR", "Stopping monitoring")
+
         monitoringMutex.Lock()
         defer monitoringMutex.Unlock()
 
@@ -335,6 +341,8 @@ func stopMonitoring() {
 
 // checkAndRestoreExistingTunnel checks if a tunnel is already running and restores monitoring.
 func checkAndRestoreExistingTunnel() {
+        debugLog("MONITOR", "Checking for existing tunnel...")
+
         if !checkProcessRunning(Config.TempFiles.SSHTunnelPID) {
                 tryAutoConnectLastHost()
                 return
@@ -390,6 +398,8 @@ func tryAutoConnectLastHost() {
                 return
         }
 
+        debugLog("MONITOR", "Auto-connect: lastHost=%s", lastHost)
+
         // Check if lastHost is a chain (contains "|")
         if strings.Contains(lastHost, "|") {
                 chainNames := strings.Split(lastHost, "|")
@@ -409,7 +419,7 @@ func tryAutoConnectLastHost() {
                 }
 
                 if len(chain) > 0 {
-                        go func() {
+                        safeGo(func() {
                                 time.Sleep(2 * time.Second)
                                 chainDisplay := strings.Join(chainNames, " -> ")
                                 establishConnection(ConnectOptions{
@@ -424,7 +434,7 @@ func tryAutoConnectLastHost() {
                                         DisplayAlias:       "Chain",
                                         DisplayTooltip:     chainDisplay,
                                 })
-                        }()
+                        })
                 }
         } else {
                 hosts := parseSSHConfig(Config.Paths.SSHConfig)
@@ -436,15 +446,13 @@ func tryAutoConnectLastHost() {
                         if host.Name == lastHost {
                                 firstGroup := hosts[0].Group
                                 if host.Group == firstGroup {
-                                        go func(h HostConfig) {
+                                        safeGo(func() {
                                                 time.Sleep(2 * time.Second)
-                                                handleHostClick(h)
-                                        }(host)
+                                                handleHostClick(host)
+                                        })
                                 }
                                 break
                         }
                 }
         }
 }
-
-

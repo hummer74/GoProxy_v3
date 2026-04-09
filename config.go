@@ -75,6 +75,7 @@ type HostConfig struct {
     User         string
     Port         string
     IdentityFile string
+    ProxyJump    string // SSH ProxyJump directive (e.g. "x-JUMPER")
 }
 
 // ProxyState is persisted on disk and used by tray monitor and restarter
@@ -158,6 +159,7 @@ func LoadConfig(cfgPath string) error {
         if !isTrayMode {
             fmt.Printf("%s→%s Configuration loaded from: %s\n", ColorCyan, ColorReset, cfgPath)
         }
+        debugLog("CONFIG", "Config loaded from: %s", cfgPath)
     } else {
         // Create default INI file
         if err := SaveConfig(cfgPath); err != nil {
@@ -337,6 +339,8 @@ func logTunnelEvent(eventType, host, message string) {
             fmt.Printf("%s→%s %s: %s\n", ColorCyan, ColorReset, host, message)
         }
     }
+
+    debugLog("TUNNEL", "[%s] %s: %s", eventType, host, message)
 }
 
 // logSSHError logs SSH connection errors
@@ -361,6 +365,8 @@ func logSSHError(host, errorType, message string) {
     if !isTrayMode {
         fmt.Printf("%s✗%s SSH error %s (%s): %s\n", ColorRed, ColorReset, host, errorType, message)
     }
+
+    debugLog("SSH", "[%s] %s (%s): %s", host, errorType, message)
 }
 
 // Helpers for status output (kept for backward compatibility)

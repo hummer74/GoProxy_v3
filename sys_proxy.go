@@ -23,6 +23,7 @@ var (
 
 // setSystemProxy configures Windows Internet Settings for PAC URL
 func setSystemProxy(pacURL string) bool {
+        debugLog("PROXY", "Setting system proxy PAC: %s", pacURL)
         k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, windows.KEY_SET_VALUE)
         if err != nil {
                 return false
@@ -42,6 +43,7 @@ func setSystemProxy(pacURL string) bool {
 
 // disableSystemProxy clears PAC and disables proxy in Windows Internet Settings
 func disableSystemProxy() {
+        debugLog("PROXY", "Disabling system proxy")
         k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, windows.KEY_SET_VALUE)
         if err != nil {
                 return
@@ -55,6 +57,7 @@ func disableSystemProxy() {
 // stopPACServer gracefully shuts down the PAC HTTP server with a 3-second timeout.
 // Falls back to force-close if graceful shutdown times out.
 func stopPACServer() {
+        debugLog("PAC", "Stopping PAC server")
         pacServerMu.Lock()
         server := pacServer
         pacServer = nil
@@ -76,6 +79,7 @@ func stopPACServer() {
 // startPACServerInternal runs a simple HTTP server to serve the PAC file from disk.
 // If a PAC server is already running, it is stopped first to avoid port conflicts.
 func startPACServerInternal() {
+        debugLog("PAC", "Starting PAC server on port %d", Config.Network.PACHttpPort)
         // Stop any existing PAC server (avoids duplicate starts and port conflicts)
         stopPACServer()
 
@@ -109,8 +113,15 @@ func startPACServerInternal() {
         savePid(Config.TempFiles.PACServerPID, os.Getpid(), "PAC HTTP Server")
 
         go func() {
+                defer func() {
+                        if r := recover(); r != nil {
+                                debugLog("PAC", "PANIC in ListenAndServe goroutine: %v", r)
+                                writeCrashLog(r)
+                        }
+                }()
                 if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
                         printWarn(fmt.Sprintf("PAC Server error: %v", err))
+                        debugLog("PAC", "PAC server error: %v", err)
                 }
         }()
 }

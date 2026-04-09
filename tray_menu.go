@@ -23,6 +23,7 @@ var (
     killMenuItem       *systray.MenuItem
     exitMenuItem       *systray.MenuItem
     hostStatusCache    *HostStatusCache // Thread-safe host status cache
+    allMenuHosts       []HostConfig     // ALL hosts from all groups (preserved for alignment & lookups)
 )
 
 // Chain display section — pre-created items shown above main menu when chain is active
@@ -86,18 +87,73 @@ func (c *HostStatusCache) Clear() {
     c.status = make(map[string]bool)
 }
 
-// createTrayMenu creates the tray menu structure
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+// hostGroup holds a group name and its hosts.
+type hostGroup struct {
+    Name  string
+    Hosts []HostConfig
+}
+
+// hostsByGroup groups hosts by their Group field, preserving insertion order.
+func hostsByGroup(hosts []HostConfig) []hostGroup {
+    var groups []hostGroup
+    seen := make(map[string]int)
+
+    for _, h := range hosts {
+        if idx, exists := seen[h.Group]; exists {
+            groups[idx].Hosts = append(groups[idx].Hosts, h)
+        } else {
+            seen[h.Group] = len(groups)
+            groups = append(groups, hostGroup{Name: h.Group, Hosts: []HostConfig{h}})
+        }
+    }
+    return groups
+}
+
+// isReverseHost returns true if the host has a ProxyJump directive.
+func isReverseHost(h HostConfig) bool {
+    return h.ProxyJump != ""
+}
+
+// getGlobalMaxLength returns the maximum host name length across all menu hosts.
+func getGlobalMaxLength() int {
+    maxLen := 0
+    hostMenuItemsMutex.RLock()
+    defer hostMenuItemsMutex.RUnlock()
+    for name := range hostMenuItems {
+        if len(name) > maxLen {
+            maxLen = len(name)
+        }
+    }
+    return maxLen
+}
+
+// ── Menu creation ────────────────────────────────────────────────────────
+
+// createTrayMenu creates the tray menu structure with ALL host groups.
 func createTrayMenu() {
+    debugLog("MENU", "createTrayMenu called, allMenuHosts count=%d", len(allMenuHosts))
     defer func() {
         if r := recover(); r != nil {
+            debugLog("MENU", "PANIC in createTrayMenu: %v", r)
+            writeCrashLog(r)
             // Add error item to menu if creation fails
-            errorItem := systray.AddMenuItem("Menu Error", "Failed to create menu")
+            errorItem := systray.AddMenuItem("Menu Error", fmt.Sprintf("Failed to create menu: %v", r))
             errorItem.Disable()
         }
     }()
 
-    // Parse SSH config to get hosts
+    // Parse SSH config to get hosts from ALL groups
+    debugLog("MENU", "Parsing SSH config: %s", Config.Paths.SSHConfig)
     hosts := parseSSHConfig(Config.Paths.SSHConfig)
+
+    debugLog("MENU", "Parsed %d hosts from SSH config", len(hosts))
+    if len(hosts) > 0 {
+        for i, h := range hosts {
+            debugLog("MENU", "  Host[%d]: name=%q group=%q host=%q port=%s proxyJump=%q", i, h.Name, h.Group, h.HostName, h.Port, h.ProxyJump)
+        }
+    }
 
     if len(hosts) == 0 {
         // Add a placeholder if no hosts found
@@ -105,54 +161,100 @@ func createTrayMenu() {
         noHostsItem.Disable()
         systray.AddSeparator()
     } else {
-        // Get first group hosts (like in interactive mode)
-        firstGroup := hosts[0].Group
-        var firstGroupHosts []HostConfig
-        for _, h := range hosts {
-            if h.Group == firstGroup {
-                firstGroupHosts = append(firstGroupHosts, h)
-            }
-        }
+        // Store all hosts globally for later use (alignment, lookups)
+        allMenuHosts = hosts
+
+        debugLog("MENU", "Pre-creating chain display section")
 
         // Pre-create chain display section (hidden until chain is connected)
         for i := 0; i < maxChainDisplay; i++ {
             chainSectionItems[i] = systray.AddMenuItem("", "")
             chainSectionItems[i].Hide()
             chainSectionItems[i].Disable()
+            debugLog("MENU", "  chainSectionItems[%d] created", i)
         }
         chainSectionBottomSep = systray.AddMenuItem(chainSeparator, "")
         chainSectionBottomSep.Disable()
         chainSectionBottomSep.Hide()
+        debugLog("MENU", "chainSectionBottomSep created")
 
-        // Check SSH connection for these hosts (async, we'll update as results come in)
-        go updateHostStatusInMenu(firstGroupHosts, true)
-
-        // Find max length for alignment
+        // Find global max length for alignment across all groups
         maxLength := 0
-        for _, host := range firstGroupHosts {
+        for _, host := range hosts {
             if len(host.Name) > maxLength {
                 maxLength = len(host.Name)
             }
         }
+        debugLog("MENU", "Global max name length: %d", maxLength)
 
-        // Add hosts from first group with alignment
-        for _, host := range firstGroupHosts {
-            // Create aligned title with initial "checking" status
-            paddedName := padRight(host.Name, maxLength)
-            menuTitle := fmt.Sprintf("○ %s", paddedName) // Empty circle for checking
-            menuItem := systray.AddMenuItem(menuTitle, fmt.Sprintf("Checking SSH connection to %s...", host.Name))
-            menuItem.Disable() // Initially disabled until we know status
+        // Group hosts by their Group field
+        groups := hostsByGroup(hosts)
+        debugLog("MENU", "Groups: %d", len(groups))
 
-            hostMenuItemsMutex.Lock()
-            hostMenuItems[host.Name] = menuItem
-            hostMenuItemsMutex.Unlock()
+        // Add hosts from each group
+        for gi, group := range groups {
+            debugLog("MENU", "Processing group %d: %q (%d hosts)", gi, group.Name, len(group.Hosts))
 
-            // Set up click handler — toggle chain selection
-            go func(h HostConfig, mi *systray.MenuItem) {
-                for range mi.ClickedCh {
-                    handleChainToggle(h)
+            // Add group separator for non-first groups
+            if gi > 0 {
+                systray.AddSeparator()
+                groupHeader := systray.AddMenuItem(fmt.Sprintf("── %s ──", group.Name), "")
+                groupHeader.Disable()
+                debugLog("MENU", "  Group separator added: %q", group.Name)
+            }
+
+            // Check SSH connection for hosts in this group (async)
+            // Capture group.Hosts to avoid closure issue with loop variable
+            groupHosts := make([]HostConfig, len(group.Hosts))
+            copy(groupHosts, group.Hosts)
+            safeGo(func() {
+                debugLog("MENU", "Background status check starting for %d hosts", len(groupHosts))
+                updateHostStatusInMenu(groupHosts, true)
+                debugLog("MENU", "Background status check completed for %d hosts", len(groupHosts))
+            })
+
+            // Add host items
+            for hi, host := range group.Hosts {
+                debugLog("MENU", "  Adding menu item[%d]: %q (group=%q)", hi, host.Name, host.Group)
+                paddedName := padRight(host.Name, maxLength)
+                menuTitle := fmt.Sprintf("○ %s", paddedName) // Empty circle for checking
+
+                var tooltip string
+                if isReverseHost(host) {
+                    tooltip = fmt.Sprintf("Reverse: %s (via %s)...", host.Name, host.ProxyJump)
+                    debugLog("MENU", "    → Reverse host (ProxyJump=%q)", host.ProxyJump)
+                } else {
+                    tooltip = fmt.Sprintf("Checking SSH connection to %s...", host.Name)
+                    debugLog("MENU", "    → Direct host")
                 }
-            }(host, menuItem)
+
+                menuItem := systray.AddMenuItem(menuTitle, tooltip)
+                menuItem.Disable() // Initially disabled until we know status
+                debugLog("MENU", "    Menu item created and disabled")
+
+                hostMenuItemsMutex.Lock()
+                hostMenuItems[host.Name] = menuItem
+                hostMenuItemsMutex.Unlock()
+                debugLog("MENU", "    Stored in hostMenuItems map")
+
+                if isReverseHost(host) {
+                    // Reverse host: click → immediate connect (auto-resolve ProxyJump)
+                    h, mi := host, menuItem
+                    safeGo(func() {
+                        for range mi.ClickedCh {
+                            handleReverseHostClick(h)
+                        }
+                    })
+                } else {
+                    // Direct host: click → toggle chain builder
+                    h, mi := host, menuItem
+                    safeGo(func() {
+                        for range mi.ClickedCh {
+                            handleChainToggle(h)
+                        }
+                    })
+                }
+            }
         }
 
         // Add chain builder controls
@@ -168,45 +270,50 @@ func createTrayMenu() {
 
     // Add Kill Proxy item
     killMenuItem = systray.AddMenuItem("Stop Proxy", "Disable proxy and kill all tunnels")
+    debugLog("MENU", "Kill Proxy item added")
 
     // Add Exit item
     exitMenuItem = systray.AddMenuItem("Exit", "Stop all proxy services and exit")
+    debugLog("MENU", "Exit item added")
 
     // Set up click handlers for static items
-    go func() {
+    safeGo(func() {
         for range killMenuItem.ClickedCh {
             handleKillProxy()
         }
-    }()
+    })
 
-    go func() {
+    safeGo(func() {
         for range exitMenuItem.ClickedCh {
             handleExit()
         }
-    }()
+    })
 
     // Set up click handlers for chain builder buttons
     if connectChainMenuItem != nil {
-        go func() {
+        safeGo(func() {
             for range connectChainMenuItem.ClickedCh {
                 handleConnectChain()
             }
-        }()
+        })
     }
     if clearChainMenuItem != nil {
-        go func() {
+        safeGo(func() {
             for range clearChainMenuItem.ClickedCh {
                 handleClearChain()
             }
-        }()
+        })
     }
 
     // Update menu state based on current tunnel status
     updateMenuState()
 }
 
+// ── Chain builder ────────────────────────────────────────────────────────
+
 // handleChainToggle toggles a host in/out of the chain builder
 func handleChainToggle(host HostConfig) {
+    debugLog("MENU", "Chain toggle: %s", host.Name)
     // Check if host is available before adding
     if status, exists := hostStatusCache.Get(host.Name); exists && !status {
         return
@@ -285,28 +392,16 @@ func clearChainBuilder() {
     chainBuilder = nil
 }
 
-// updateChainBuilderUI updates all menu items to reflect the current chain builder state
+// updateChainBuilderUI updates all menu items to reflect the current chain builder state.
+// Iterates over ALL hostMenuItems (all groups) instead of just the first group.
 func updateChainBuilderUI() {
-    // Parse SSH config to get max length for alignment
-    hosts := parseSSHConfig(Config.Paths.SSHConfig)
-    if len(hosts) == 0 {
-        return
-    }
-
-    firstGroup := hosts[0].Group
-    var firstGroupHosts []HostConfig
-    for _, h := range hosts {
-        if h.Group == firstGroup {
-            firstGroupHosts = append(firstGroupHosts, h)
+    defer func() {
+        if r := recover(); r != nil {
+            debugLog("MENU", "PANIC in updateChainBuilderUI: %v", r)
+            writeCrashLog(r)
         }
-    }
-
-    maxLength := 0
-    for _, host := range firstGroupHosts {
-        if len(host.Name) > maxLength {
-            maxLength = len(host.Name)
-        }
-    }
+    }()
+    maxLength := getGlobalMaxLength()
 
     chainCount := getChainBuilderCount()
     chainCopy := getChainBuilderCopy()
@@ -329,17 +424,16 @@ func updateChainBuilderUI() {
     hostMenuItemsMutex.RLock()
     defer hostMenuItemsMutex.RUnlock()
 
-    // Update each host menu item
-    for _, host := range firstGroupHosts {
-        menuItem, exists := hostMenuItems[host.Name]
-        if !exists || menuItem == nil {
+    // Update each host menu item (all groups)
+    for hostName, menuItem := range hostMenuItems {
+        if menuItem == nil {
             continue
         }
 
-        paddedName := padRight(host.Name, maxLength)
+        paddedName := padRight(hostName, maxLength)
 
         // Skip hosts that are part of an active chain — handled by updateMenuState
-        if activeChainSet[host.Name] {
+        if activeChainSet[hostName] {
             menuItem.Hide()
             continue
         }
@@ -348,11 +442,16 @@ func updateChainBuilderUI() {
         menuItem.Show()
 
         // Skip currently connected single host — handled by updateMenuState
-        if connState.IsActive() && !strings.Contains(currentHostVal, " -> ") && host.Name == currentHostVal {
+        if connState.IsActive() && !strings.Contains(currentHostVal, " -> ") && hostName == currentHostVal {
             continue
         }
 
-        if pos, inChain := chainPositions[host.Name]; inChain {
+        // Skip reverse hosts — they don't participate in chain builder
+        if hc := findHostByName(allMenuHosts, hostName); hc != nil && isReverseHost(*hc) {
+            continue
+        }
+
+        if pos, inChain := chainPositions[hostName]; inChain {
             // Host is in chain builder — show with [N] number
             posStr := fmt.Sprintf("[%d]", pos)
             menuItem.SetTitle(fmt.Sprintf("%s %s", posStr, paddedName))
@@ -367,14 +466,14 @@ func updateChainBuilderUI() {
             menuItem.Enable()
         } else {
             // Host is not in chain — show normal status from cache
-            if status, ok := hostStatusCache.Get(host.Name); ok {
+            if status, ok := hostStatusCache.Get(hostName); ok {
                 if status {
                     menuItem.SetTitle(fmt.Sprintf("%s %s", GreenCircle, paddedName))
-                    menuItem.SetTooltip(fmt.Sprintf("%s: SSH connection available", host.Name))
+                    menuItem.SetTooltip(fmt.Sprintf("%s: SSH connection available", hostName))
                     menuItem.Enable()
                 } else {
                     menuItem.SetTitle(fmt.Sprintf("%s %s", RedCircle, paddedName))
-                    menuItem.SetTooltip(fmt.Sprintf("%s: SSH connection failed", host.Name))
+                    menuItem.SetTooltip(fmt.Sprintf("%s: SSH connection failed", hostName))
                     menuItem.Disable()
                 }
             }
@@ -415,22 +514,85 @@ func updateChainBuilderUI() {
     }
 }
 
-// updateHostStatusInMenu checks host status and updates menu
-// initialCheck is true when called from createTrayMenu (shows "checking" status)
+// ── Host status checking ─────────────────────────────────────────────────
+
+// updateHostStatusInMenu checks host status and updates menu items.
+// For reverse hosts (with ProxyJump), checks the ProxyJump target instead,
+// since reverse hosts connect to 127.0.0.1:PORT which isn't directly reachable.
+// initialCheck is true when called from createTrayMenu (shows "checking" status).
 func updateHostStatusInMenu(hosts []HostConfig, initialCheck bool) {
+    defer func() {
+        if r := recover(); r != nil {
+            debugLog("MENU", "PANIC in updateHostStatusInMenu: %v", r)
+            writeCrashLog(r)
+        }
+    }()
+    debugLog("MENU", "Checking status for %d hosts (initial=%v)", len(hosts), initialCheck)
     // Give time for menu rendering
     time.Sleep(100 * time.Millisecond)
 
-    // Check host statuses
-    sshStatusCache := checkSSHConnectionBatch(hosts, Config.Paths.WorkDir)
+    // Defensive: if hostStatusCache is nil, skip
+    if hostStatusCache == nil {
+        debugLog("MENU", "hostStatusCache is nil, skipping status update")
+        return
+    }
 
-    // Find max length for alignment
-    maxLength := 0
-    for _, host := range hosts {
-        if len(host.Name) > maxLength {
-            maxLength = len(host.Name)
+    // Build a lookup of all parsed hosts (for resolving ProxyJump targets)
+    parsedMap := make(map[string]HostConfig)
+    for _, h := range allMenuHosts {
+        parsedMap[h.Name] = h
+    }
+
+    // For each host, determine the effective host to check.
+    // Reverse hosts → check their ProxyJump target; direct hosts → check themselves.
+    type checkEntry struct {
+        effectiveHost HostConfig
+        origNames     []string // all original host names that map to this check
+    }
+    effectiveMap := make(map[string]*checkEntry) // key = effective host name
+
+    for _, h := range hosts {
+        effectiveHost := h
+        if isReverseHost(h) {
+            if target, ok := parsedMap[h.ProxyJump]; ok {
+                effectiveHost = target
+            }
+            // If ProxyJump target not found, fall back to checking the host directly
+        }
+
+        if entry, exists := effectiveMap[effectiveHost.Name]; exists {
+            entry.origNames = append(entry.origNames, h.Name)
+        } else {
+            effectiveMap[effectiveHost.Name] = &checkEntry{
+                effectiveHost: effectiveHost,
+                origNames:     []string{h.Name},
+            }
         }
     }
+
+    // Build deduplicated effective hosts list
+    var effectiveHosts []HostConfig
+    for _, entry := range effectiveMap {
+        effectiveHosts = append(effectiveHosts, entry.effectiveHost)
+    }
+
+    // Check effective hosts
+    sshStatusCache := checkSSHConnectionBatch(effectiveHosts, Config.Paths.WorkDir)
+
+    // Map results back to original host names
+    resultMap := make(map[string]bool)
+    for effectiveName, status := range sshStatusCache {
+        entry := effectiveMap[effectiveName]
+        if entry == nil {
+            continue
+        }
+        for _, origName := range entry.origNames {
+            resultMap[origName] = status
+        }
+    }
+
+    // Find max length for alignment
+    maxLength := getGlobalMaxLength()
 
     // Build set of active chain hosts (if chain is connected)
     activeChainSet := make(map[string]bool)
@@ -453,74 +615,76 @@ func updateHostStatusInMenu(hosts []HostConfig, initialCheck bool) {
 
         paddedName := padRight(host.Name, maxLength)
 
-        // Skip updating if this host is currently connected (it will be handled by updateMenuState)
+        // Skip updating if this host is currently connected (handled by updateMenuState)
         if connState.IsActive() {
             if strings.Contains(currentHostVal, " -> ") {
-                // Current connection is a chain, skip all chain hosts
                 if activeChainSet[host.Name] {
                     hostStatusCache.Set(host.Name, true)
                     continue
                 }
             } else if host.Name == currentHostVal {
-                // This is the currently connected single host
                 hostStatusCache.Set(host.Name, true)
                 continue
             }
         }
 
-        // Update status cache
-        hostStatusCache.Set(host.Name, sshStatusCache[host.Name])
+        // Update status cache with mapped result
+        hostStatusCache.Set(host.Name, resultMap[host.Name])
 
         // Skip hosts that are in chain builder — they have their own display
         if getChainPosition(host.Name) > 0 {
             continue
         }
 
-        if sshStatusCache[host.Name] {
-            // Host is available - green circle and enable menu item
+        // Build tooltip with ProxyJump info for reverse hosts
+        var tooltip string
+        if isReverseHost(host) {
+            tooltip = fmt.Sprintf("%s: %s (via %s)", host.Name, statusText(resultMap[host.Name]), host.ProxyJump)
+        } else {
+            tooltip = fmt.Sprintf("%s: %s", host.Name, statusText(resultMap[host.Name]))
+        }
+
+        if resultMap[host.Name] {
             menuItem.SetTitle(fmt.Sprintf("%s %s", GreenCircle, paddedName))
-            menuItem.SetTooltip(fmt.Sprintf("%s: SSH connection available", host.Name))
+            menuItem.SetTooltip(tooltip)
             menuItem.Enable()
         } else {
-            // Host is unavailable - red circle and disable menu item
             menuItem.SetTitle(fmt.Sprintf("%s %s", RedCircle, paddedName))
-            menuItem.SetTooltip(fmt.Sprintf("%s: SSH connection failed", host.Name))
+            menuItem.SetTooltip(tooltip)
             menuItem.Disable()
         }
     }
 }
 
-// updateMenuState updates the state of menu items based on current tunnel status
+// statusText returns a human-readable status string.
+func statusText(available bool) string {
+    if available {
+        return "SSH connection available"
+    }
+    return "SSH connection failed"
+}
+
+// ── Menu state ───────────────────────────────────────────────────────────
+
+// updateMenuState updates the state of menu items based on current tunnel status.
+// Iterates over ALL hostMenuItems (all groups) instead of just the first group.
 func updateMenuState() {
-    // Parse SSH config to get max length for alignment
-    hosts := parseSSHConfig(Config.Paths.SSHConfig)
-    if len(hosts) == 0 {
-        return
-    }
-
-    // Get first group hosts
-    firstGroup := hosts[0].Group
-    var firstGroupHosts []HostConfig
-    for _, h := range hosts {
-        if h.Group == firstGroup {
-            firstGroupHosts = append(firstGroupHosts, h)
+    defer func() {
+        if r := recover(); r != nil {
+            debugLog("MENU", "PANIC in updateMenuState: %v", r)
+            writeCrashLog(r)
         }
-    }
-
-    // Find max length for alignment
-    maxLength := 0
-    for _, host := range firstGroupHosts {
-        if len(host.Name) > maxLength {
-            maxLength = len(host.Name)
-        }
-    }
+    }()
+    maxLength := getGlobalMaxLength()
 
     // Parse active chain connection
+    currentHostVal := connState.GetHost()
+    debugLog("MENU", "updateMenuState: active=%v, host=%q", connState.IsActive(), currentHostVal)
+
     isChain := false
     var chainParts []string
     chainHostSet := make(map[string]bool)
     lastChainHost := ""
-    currentHostVal := connState.GetHost()
     if connState.IsActive() && currentHostVal != "" {
         if strings.Contains(currentHostVal, " -> ") {
             isChain = true
@@ -535,7 +699,7 @@ func updateMenuState() {
     }
 
     // --- Chain section display (above main menu) ---
-    if isChain {
+    if isChain && chainSectionBottomSep != nil {
         chainSectionBottomSep.Show()
 
         // Find max name length in chain for padding
@@ -547,12 +711,15 @@ func updateMenuState() {
         }
 
         for i := 0; i < maxChainDisplay; i++ {
+            item := chainSectionItems[i]
+            if item == nil {
+                continue
+            }
             if i < len(chainParts) {
                 hostName := chainParts[i]
                 pos := i + 1
                 posStr := fmt.Sprintf("[%d]", pos)
                 paddedName := padRight(hostName, chainMaxLength)
-                item := chainSectionItems[i]
 
                 if hostName == lastChainHost {
                     // Exit host: ✓ ● [N] alias (HH:MM)
@@ -583,14 +750,18 @@ func updateMenuState() {
                 }
                 item.Show()
             } else {
-                chainSectionItems[i].Hide()
+                item.Hide()
             }
         }
     } else {
         // Hide entire chain section
-        chainSectionBottomSep.Hide()
+        if chainSectionBottomSep != nil {
+            chainSectionBottomSep.Hide()
+        }
         for i := 0; i < maxChainDisplay; i++ {
-            chainSectionItems[i].Hide()
+            if chainSectionItems[i] != nil {
+                chainSectionItems[i].Hide()
+            }
         }
     }
 
@@ -605,7 +776,7 @@ func updateMenuState() {
         chainBuilderPos[h.Name] = i + 1
     }
 
-    // Update each host menu item
+    // Update each host menu item (all groups)
     for hostName, menuItem := range hostMenuItems {
         if menuItem == nil {
             continue
@@ -658,14 +829,28 @@ func updateMenuState() {
             if status, exists := hostStatusCache.Get(hostName); exists {
                 var statusIcon, tooltip string
 
-                if status {
-                    statusIcon = GreenCircle
-                    tooltip = fmt.Sprintf("%s: SSH connection available", hostName)
-                    menuItem.Enable()
+                if isReverseHostByName(hostName) {
+                    // Reverse host — include ProxyJump info in tooltip
+                    pjName := getProxyJumpName(hostName)
+                    if status {
+                        statusIcon = GreenCircle
+                        tooltip = fmt.Sprintf("%s: %s (via %s)", hostName, "SSH connection available", pjName)
+                        menuItem.Enable()
+                    } else {
+                        statusIcon = RedCircle
+                        tooltip = fmt.Sprintf("%s: %s (via %s)", hostName, "SSH connection failed", pjName)
+                        menuItem.Disable()
+                    }
                 } else {
-                    statusIcon = RedCircle
-                    tooltip = fmt.Sprintf("%s: SSH connection failed", hostName)
-                    menuItem.Disable()
+                    if status {
+                        statusIcon = GreenCircle
+                        tooltip = fmt.Sprintf("%s: SSH connection available", hostName)
+                        menuItem.Enable()
+                    } else {
+                        statusIcon = RedCircle
+                        tooltip = fmt.Sprintf("%s: SSH connection failed", hostName)
+                        menuItem.Disable()
+                    }
                 }
 
                 menuItem.SetTitle(fmt.Sprintf("%s %s", statusIcon, paddedName))
@@ -690,6 +875,8 @@ func menuUpdateLoop() {
     }
 }
 
+// ── Utility functions ────────────────────────────────────────────────────
+
 // padRight pads string with spaces to the right to achieve alignment
 func padRight(s string, length int) string {
     if len(s) >= length {
@@ -704,4 +891,20 @@ func formatDuration(d time.Duration) string {
     hours := (totalMinutes / 60) % 24
     minutes := totalMinutes % 60
     return fmt.Sprintf("%02d:%02d", hours, minutes)
+}
+
+// isReverseHostByName checks if a host (by name) is a reverse host.
+func isReverseHostByName(name string) bool {
+    if hc := findHostByName(allMenuHosts, name); hc != nil {
+        return isReverseHost(*hc)
+    }
+    return false
+}
+
+// getProxyJumpName returns the ProxyJump target name for a host, or empty string.
+func getProxyJumpName(name string) string {
+    if hc := findHostByName(allMenuHosts, name); hc != nil {
+        return hc.ProxyJump
+    }
+    return ""
 }

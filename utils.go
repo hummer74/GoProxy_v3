@@ -12,13 +12,6 @@ import (
         windows "golang.org/x/sys/windows"
 )
 
-// clearScreen clears the Windows console
-func clearScreen() {
-        cmd := exec.Command("cmd", "/c", "cls")
-        cmd.Stdout = os.Stdout
-        _ = cmd.Run()
-}
-
 // loadSSHKeyPassphrase loads SSH-KEY-PASS from file
 func loadSSHKeyPassphrase() string {
         if Config.Paths.SSHKeyPassword == "" {
@@ -30,6 +23,7 @@ func loadSSHKeyPassphrase() string {
                 return ""
         }
 
+        debugLog("UTILS", "SSH key passphrase loaded")
         return strings.TrimSpace(string(data))
 }
 

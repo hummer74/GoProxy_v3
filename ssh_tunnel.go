@@ -1,4 +1,4 @@
-﻿// ssh_tunnel.go
+// ssh_tunnel.go
 package main
 
 import (
@@ -19,6 +19,8 @@ func startSSHTunnel(sshCmd []string) bool {
 
 // startSSHTunnelWithRetries attempts to start SSH tunnel with progressive timeouts based on chain length
 func startSSHTunnelWithRetries(sshCmd []string, chainLength int) bool {
+        debugLog("TUNNEL", "Starting tunnel with %d retries, chain length %d", 3, chainLength)
+
         // Base timeout: 15 seconds per hop, but at least 15s and at most 90s
         baseTimeout := 15 * time.Duration(chainLength) * time.Second
         if baseTimeout < 15*time.Second {
@@ -37,8 +39,10 @@ func startSSHTunnelWithRetries(sshCmd []string, chainLength int) bool {
 
         for attempt := 1; attempt <= 3; attempt++ {
                 timeout := timeouts[attempt-1]
+                debugLog("TUNNEL", "Attempt %d/%d (timeout %v)", attempt, 3, timeout)
 
                 if startSSHTunnelWithTimeout(sshCmd, timeout) {
+                        debugLog("TUNNEL", "Tunnel established on attempt %d", attempt)
                         logTunnelEvent("OK", extractHostFromSSHCommand(sshCmd),
                                 fmt.Sprintf("SSH tunnel established on attempt %d/%d (%d-hop chain)", attempt, 3, chainLength))
                         return true
@@ -51,6 +55,7 @@ func startSSHTunnelWithRetries(sshCmd []string, chainLength int) bool {
                 }
         }
 
+        debugLog("TUNNEL", "All attempts failed")
         logTunnelEvent("ERROR", extractHostFromSSHCommand(sshCmd),
                 fmt.Sprintf("Failed to establish SSH tunnel after 3 attempts (%d-hop chain)", chainLength))
         return false
@@ -161,10 +166,18 @@ func startSSHTunnelWithTimeout(sshCmd []string, timeout time.Duration) bool {
 
         // Save PID immediately
         savePid(Config.TempFiles.SSHTunnelPID, cmd.Process.Pid, "SSH Tunnel")
+        debugLog("TUNNEL", "SSH process started (PID saved), waiting for connectivity (timeout %v)", timeout)
 
         // Channel to track if process exits early
         done := make(chan error, 1)
         go func() {
+                defer func() {
+                        if r := recover(); r != nil {
+                                debugLog("TUNNEL", "PANIC in SSH Wait goroutine: %v", r)
+                                writeCrashLog(r)
+                                done <- fmt.Errorf("panic in SSH wait: %v", r)
+                        }
+                }()
                 done <- cmd.Wait()
         }()
 

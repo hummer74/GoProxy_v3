@@ -71,6 +71,7 @@ func (c *sshConfigCache) invalidate() {
 // modification time changes, so manual edits to ~/.ssh/config are picked up
 // within one polling cycle.
 func parseSSHConfig(path string) []HostConfig {
+        debugLog("PARSER", "Parsing SSH config: %s", path)
         // Check cache first
         if cached := configCache.getCachedHosts(path); cached != nil {
                 return cached
@@ -132,6 +133,8 @@ func parseSSHConfig(path string) []HostConfig {
                                         if current.IdentityFile == "" {
                                                 current.IdentityFile = value
                                         }
+                                case "proxyjump":
+                                        current.ProxyJump = value
                                 default:
                                         // Ignore other parameters
                                 }
@@ -145,6 +148,7 @@ func parseSSHConfig(path string) []HostConfig {
         }
 
         printInfo("Parsed hosts from SSH config")
+        debugLog("PARSER", "Parsed %d hosts", len(hosts))
 
         // Store in cache
         configCache.setCachedHosts(path, hosts)

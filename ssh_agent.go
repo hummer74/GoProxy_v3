@@ -14,6 +14,7 @@ import (
 
 // ensureSSHAgent checks if ssh-agent is running, starts it if needed, and adds the key
 func ensureSSHAgent(sshKeyPath, sshKeyPass string) bool {
+    debugLog("AGENT", "ensureSSHAgent: key=%s", sshKeyPath)
     if sshKeyPath == "" {
         return true
     }
@@ -47,6 +48,7 @@ func ensureSSHAgent(sshKeyPath, sshKeyPass string) bool {
 
 // checkAndStartSSHAgent checks and starts SSH-Agent service if necessary
 func checkAndStartSSHAgent() bool {
+    debugLog("AGENT", "Checking SSH-Agent service...")
     if _, err := exec.LookPath("ssh-add"); err != nil {
         return false
     }
@@ -75,7 +77,9 @@ func checkAndStartSSHAgent() bool {
     cmdCheck2.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
     output2, _ := cmdCheck2.CombinedOutput()
 
-    return strings.Contains(string(output2), "RUNNING")
+    result := strings.Contains(string(output2), "RUNNING")
+    debugLog("AGENT", "SSH-Agent service check result: running=%v", result)
+    return result
 }
 
 func isKeyInAgent(keyPath string) bool {
@@ -115,6 +119,7 @@ func checkKeyFingerprint(keyPath, agentOutput string) bool {
 }
 
 func addKeyToAgent(keyPath, passphrase string) bool {
+    debugLog("AGENT", "Adding key to agent: %s", filepath.Base(keyPath))
     ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
     defer cancel()
 
@@ -207,6 +212,7 @@ func stopSSHAgent() bool {
 
 // cleanupSSHAgent removes added keys from agent
 func cleanupSSHAgent() {
+    debugLog("AGENT", "Cleaning up SSH agent")
     cmd := exec.Command("ssh-add", "-D")
     cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
     _ = cmd.Run()
