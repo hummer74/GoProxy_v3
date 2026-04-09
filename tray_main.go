@@ -37,6 +37,7 @@ func runTrayMode() {
 
     if hwnd != 0 && !debugEnabled {
         debugLog("TRAY", "Console detected, re-launching without window")
+        ReleaseAppMutex() // Release mutex BEFORE child tries to acquire it
         exe, _ := os.Executable()
         cmd := exec.Command(exe)
         cmd.SysProcAttr = &windows.SysProcAttr{

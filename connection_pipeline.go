@@ -7,6 +7,7 @@ package main
 
 import (
         "fmt"
+        "strings"
         "time"
 )
 
@@ -157,7 +158,7 @@ func establishConnection(opts ConnectOptions) *ProxyState {
                 SaveState(state)
                 debugLog("PIPELINE", "State saved (chain: %s)", fullChain)
                 if opts.SaveLastHost {
-                        SaveLastHost(fmt.Sprintf("%s", chainNames))
+                        SaveLastHost(strings.Join(chainNames, "|"))
                 }
                 return finishConnection(state, alias, tooltip, opts)
         }

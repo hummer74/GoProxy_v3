@@ -16,7 +16,7 @@ timeout /t 1 /nobreak >nul
 taskkill /F /IM ssh-agent.exe /IM ssh-add.exe
 timeout /t 1 /nobreak >nul
 echo Starting GoProxy...
-"%~dp0GoProxy.exe" -log
+"%~dp0GoProxy.exe"
 echo GoProxy started.
 timeout /t 2 /nobreak >nul
 echo EXIT.
