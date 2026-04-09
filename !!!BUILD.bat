@@ -9,6 +9,8 @@ if %ERRORLEVEL% NEQ 0 (
     pause
     exit /b %ERRORLEVEL%
 )
+timeout /t 5 /nobreak >nul
+exit 0
 upx --ultra-brute GoProxy.exe
 timeout /t 1 /nobreak >nul
 exit 0

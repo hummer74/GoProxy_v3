@@ -360,27 +360,26 @@ func handleKillProxy() {
     updateMenuState()
 }
 
-// handleExit handles the Exit menu item - performs full cleanup using stop mode
+// handleExit handles the Exit menu item - performs full cleanup inline
 func handleExit() {
     debugLog("HANDLER", "Exit")
     logTunnelEvent("INFO", connState.GetHost(), "User requested exit")
 
     stopMonitoring()
-    os.WriteFile(Config.TempFiles.StopFlag, []byte("stop"), 0644)
 
-    execPath, err := os.Executable()
-    if err != nil {
-        cleanupOnExitFallback()
-        return
-    }
+    // Kill SSH tunnel
+    killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
 
-    cmd := exec.Command(execPath, "-stop")
-    cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+    // Stop PAC server
+    stopPACServer()
 
-    if err := cmd.Start(); err != nil {
-        cleanupOnExitFallback()
-    }
+    // Disable system proxy
+    disableSystemProxy()
 
+    // Clean up all temp files
+    cleanupTempFiles()
+
+    // Stop tickers
     if menuUpdateTicker != nil {
         menuUpdateTicker.Stop()
     }
@@ -388,28 +387,24 @@ func handleExit() {
         hostsCheckTicker.Stop()
     }
 
+    time.Sleep(500 * time.Millisecond)
     systray.Quit()
 }
 
-// cleanupOnExitFallback is used when we can't start the stop process
-func cleanupOnExitFallback() {
-    disableSystemProxy()
-
-    killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
-    stopPACServer()
-
-    time.Sleep(2 * time.Second)
-
-    os.Remove(Config.TempFiles.TrayPID)
-
-    if menuUpdateTicker != nil {
-        menuUpdateTicker.Stop()
+// cleanupTempFiles removes all GoProxy temp files
+func cleanupTempFiles() {
+    debugLog("HANDLER", "Cleaning up temp files")
+    files := []string{
+        Config.TempFiles.PACFile,
+        Config.TempFiles.StateFile,
+        Config.TempFiles.SSHTunnelPID,
+        Config.TempFiles.TrayPID,
+        Config.TempFiles.PACServerPID,
+        Config.TempFiles.StopFlag,
     }
-    if hostsCheckTicker != nil {
-        hostsCheckTicker.Stop()
+    for _, f := range files {
+        os.Remove(f)
     }
-
-    systray.Quit()
 }
 
 // handleFatalError handles fatal error state with 60-minute timeout

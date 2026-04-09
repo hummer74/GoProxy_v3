@@ -140,7 +140,13 @@ func addKeyToAgent(keyPath, passphrase string) bool {
     outputStr := string(output)
 
     if ctx.Err() == context.DeadlineExceeded {
-        logTunnelEvent("ERROR", "SSH-Agent", "ssh-add timed out (prevented indefinite hang)")
+        // Race condition: context expired but ssh-add may have succeeded.
+        // Verify the key is actually in the agent before reporting failure.
+        if isKeyInAgent(keyPath) {
+            debugLog("AGENT", "ssh-add timed out but key is present in agent — success")
+            return true
+        }
+        logTunnelEvent("ERROR", "SSH-Agent", "ssh-add timed out and key not in agent")
         return false
     }
 
@@ -185,7 +191,11 @@ func trySSHAdd(sshKeyPath, sshKeyPass string) bool {
     outputStr := string(output)
 
     if ctx.Err() == context.DeadlineExceeded {
-        logTunnelEvent("ERROR", "SSH-Agent", "trySSHAdd timed out (prevented indefinite hang)")
+        if isKeyInAgent(sshKeyPath) {
+            debugLog("AGENT", "trySSHAdd timed out but key is present in agent — success")
+            return true
+        }
+        logTunnelEvent("ERROR", "SSH-Agent", "trySSHAdd timed out and key not in agent")
         return false
     }
 
