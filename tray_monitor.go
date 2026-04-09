@@ -2,10 +2,10 @@
 package main
 
 import (
-	"fmt"
-	"os"
-	"strings"
-	"time"
+        "fmt"
+        "os"
+        "strings"
+        "time"
 )
 
 var checkAndReturnToOriginalHostFunc func(*ProxyState) bool
@@ -14,508 +14,437 @@ var checkInternetFunc func() bool
 var attemptTunnelRestartFunc func(*ProxyState) bool
 
 func init() {
-	checkAndReturnToOriginalHostFunc = checkAndReturnToOriginalHost
-	checkProxyConnectivityFunc = checkProxyConnectivity
-	checkInternetFunc = checkInternet
-	attemptTunnelRestartFunc = attemptTunnelRestart
+        checkAndReturnToOriginalHostFunc = checkAndReturnToOriginalHost
+        checkProxyConnectivityFunc = checkProxyConnectivity
+        checkInternetFunc = checkInternet
+        attemptTunnelRestartFunc = attemptTunnelRestart
 }
 
-// startMonitoring starts a new monitoring loop for the current connection
+// ---------------------------------------------------------------------------
+// monitoringConfig — holds all timing and mutable state for a single
+// monitoring session, replacing 7 loose local variables.
+// ---------------------------------------------------------------------------
+
+type monitoringConfig struct {
+        // Timing configuration (resolved once from Config at session start)
+        socksCheckInterval    time.Duration
+        internetCheckDelay    time.Duration
+        internetCheckRetry    time.Duration
+        reconnectDelay        time.Duration
+        maxReconnectTime      time.Duration
+        origHostCheckInterval time.Duration
+
+        // Mutable session state
+        isReconnecting        bool
+        isFatalError          bool
+        reconnectStartTime    time.Time
+        lastInternetCheck     time.Time
+        lastReconnectAttempt  time.Time
+        lastSocksCheck        time.Time
+        lastOrigHostCheck     time.Time
+        networkAvailable      bool
+        reconnectAttempts     int
+}
+
+func newMonitoringConfig() *monitoringConfig {
+        return &monitoringConfig{
+                socksCheckInterval:    time.Duration(Config.Network.SocksCheckInterval) * time.Second,
+                internetCheckDelay:    time.Duration(Config.Network.InternetCheckDelay) * time.Second,
+                internetCheckRetry:    time.Duration(Config.Network.InternetCheckRetry) * time.Second,
+                reconnectDelay:        time.Duration(Config.Network.ReconnectAttemptDelay) * time.Second,
+                maxReconnectTime:      time.Duration(Config.Network.MaxReconnectTime) * time.Second,
+                origHostCheckInterval: time.Duration(Config.General.OriginalHostCheck) * time.Second,
+        }
+}
+
+// ---------------------------------------------------------------------------
+// Tray-display helpers — eliminate the repeated "if chain / else" pattern
+// that appeared 6 times in the original startMonitoring().
+// ---------------------------------------------------------------------------
+
+// aliasForState returns the short label used in tray title/tooltip for a connection.
+func aliasForState(state *ProxyState) string {
+        if state.IsChain {
+                return "Chain"
+        }
+        return state.Host
+}
+
+// remoteForState returns the remote-host description for tray tooltips.
+func remoteForState(state *ProxyState) string {
+        if state.IsChain {
+                return state.Host
+        }
+        return state.RemoteHost
+}
+
+// ---------------------------------------------------------------------------
+// State handlers — one method per monitoring state
+// ---------------------------------------------------------------------------
+
+// checkOriginalHostReturn periodically checks if the original host is
+// available and attempts to return when in failover mode.
+// Returns true if the caller should exit monitoring (successfully returned).
+func (mc *monitoringConfig) checkOriginalHostReturn(state *ProxyState) bool {
+        if !Config.General.ReturnToOriginalHost || !state.IsFailoverActive {
+                return false
+        }
+        if mc.origHostCheckInterval == 0 || time.Since(mc.lastOrigHostCheck) < mc.origHostCheckInterval {
+                return false
+        }
+        mc.lastOrigHostCheck = time.Now()
+
+        return checkAndReturnToOriginalHostFunc(state)
+}
+
+// handleFatalErrorState periodically pings SOCKS5; if the tunnel recovers on
+// its own the state resets to normal.
+func (mc *monitoringConfig) handleFatalErrorState(state *ProxyState) {
+        if time.Since(mc.lastSocksCheck) < mc.socksCheckInterval {
+                return
+        }
+        mc.lastSocksCheck = time.Now()
+
+        if checkProxyConnectivityFunc() {
+                mc.isFatalError = false
+                mc.isReconnecting = false
+                mc.reconnectAttempts = 0
+                connState.SetStartTime(time.Now())
+                connState.SetActive(true)
+                logTunnelEvent("OK", state.Host, "Tunnel recovered from fatal error state")
+                updateTrayStatusOnline(aliasForState(state), remoteForState(state))
+                updateMenuState()
+        }
+}
+
+// handleNormalState checks SOCKS5 periodically.  When the tunnel drops it
+// transitions into reconnection state and optionally triggers smart failover.
+func (mc *monitoringConfig) handleNormalState(state *ProxyState) {
+        if time.Since(mc.lastSocksCheck) < mc.socksCheckInterval {
+                return
+        }
+        mc.lastSocksCheck = time.Now()
+
+        if checkProxyConnectivityFunc() {
+                // Tunnel is online — if we were reconnecting, mark as recovered
+                if mc.isReconnecting {
+                        mc.isReconnecting = false
+                        mc.reconnectAttempts = 0
+                        connState.SetStartTime(time.Now())
+                        connState.SetActive(true)
+                        logTunnelEvent("OK", state.Host, "Tunnel reconnected successfully")
+                        updateMenuState()
+                }
+                return
+        }
+
+        // Tunnel went offline
+        if mc.isReconnecting {
+                return // already handling
+        }
+
+        mc.isReconnecting = true
+        mc.reconnectStartTime = time.Now()
+        mc.lastInternetCheck = time.Time{}
+        mc.lastReconnectAttempt = time.Time{}
+        mc.reconnectAttempts = 0
+        connState.SetActive(false)
+        logTunnelEvent("ERROR", state.Host, "Tunnel lost connection")
+        updateMenuState()
+
+        // Try smart failover if enabled (single-host only)
+        if Config.General.SmartFailover && !state.IsChain {
+                if handleSmartFailover(state) {
+                        return // switched to another host — this monitoring session ends
+                }
+        }
+
+        updateTrayStatusReconnecting(aliasForState(state), remoteForState(state))
+        disableSystemProxy()
+        killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
+}
+
+// handleReconnectionState manages the reconnect cycle: wait for internet,
+// then periodically attempt tunnel restart until max time is reached.
+func (mc *monitoringConfig) handleReconnectionState(state *ProxyState) {
+        // First — check if the tunnel recovered on its own (e.g. SSH auto-reconnect).
+        // This preserves the original behaviour where the SOCKS check ran in every state.
+        if time.Since(mc.lastSocksCheck) >= mc.socksCheckInterval {
+                mc.lastSocksCheck = time.Now()
+                if checkProxyConnectivityFunc() {
+                        mc.isReconnecting = false
+                        mc.reconnectAttempts = 0
+                        connState.SetStartTime(time.Now())
+                        connState.SetActive(true)
+                        logTunnelEvent("OK", state.Host, "Tunnel recovered on its own during reconnection")
+                        updateTrayStatusOnline(aliasForState(state), remoteForState(state))
+                        updateMenuState()
+                        pacURL := fmt.Sprintf("http://127.0.0.1:%d/x_proxy.pac", Config.Network.PACHttpPort)
+                        setSystemProxy(pacURL)
+                        return
+                }
+        }
+
+        // Check max reconnection time
+        if time.Since(mc.reconnectStartTime) > mc.maxReconnectTime {
+                logTunnelEvent("ERROR", state.Host,
+                        fmt.Sprintf("Max reconnection time exceeded (%d seconds)", Config.Network.MaxReconnectTime))
+                handleFatalError(state.Host, state.RemoteHost)
+                mc.isFatalError = true
+                mc.isReconnecting = false
+                connState.SetActive(false)
+                updateMenuState()
+                return
+        }
+
+        // Wait for internet-check delay before starting network probes
+        if time.Since(mc.reconnectStartTime) < mc.internetCheckDelay {
+                return
+        }
+
+        // Check internet connectivity (respecting retry interval)
+        if time.Since(mc.lastInternetCheck) >= mc.internetCheckRetry {
+                mc.lastInternetCheck = time.Now()
+                mc.networkAvailable = checkInternetFunc()
+
+                if !mc.networkAvailable {
+                        logTunnelEvent("WARN", state.Host, "No internet connectivity detected")
+                        updateTrayStatusNoInternet(aliasForState(state), remoteForState(state),
+                                time.Since(mc.reconnectStartTime), mc.maxReconnectTime)
+                        return
+                }
+        } else if !mc.networkAvailable {
+                updateTrayStatusNoInternet(aliasForState(state), remoteForState(state),
+                        time.Since(mc.reconnectStartTime), mc.maxReconnectTime)
+                return
+        }
+
+        // Internet is available — attempt reconnection (respecting attempt delay)
+        if time.Since(mc.lastReconnectAttempt) < mc.reconnectDelay {
+                return
+        }
+        mc.lastReconnectAttempt = time.Now()
+        mc.reconnectAttempts++
+
+        remainingTime := mc.maxReconnectTime - time.Since(mc.reconnectStartTime)
+        logTunnelEvent("INFO", state.Host,
+                fmt.Sprintf("Reconnection attempt %d (%.0f minutes remaining)",
+                        mc.reconnectAttempts, remainingTime.Minutes()))
+
+        updateTrayStatusAttempting(aliasForState(state), remoteForState(state),
+                mc.reconnectAttempts, remainingTime)
+
+        if attemptTunnelRestartFunc(state) {
+                mc.isReconnecting = false
+                mc.reconnectAttempts = 0
+                connState.SetStartTime(time.Now())
+                connState.SetActive(true)
+                logTunnelEvent("OK", state.Host, "Tunnel reestablished after reconnection")
+                updateTrayStatusOnline(aliasForState(state), remoteForState(state))
+                updateMenuState()
+                pacURL := fmt.Sprintf("http://127.0.0.1:%d/x_proxy.pac", Config.Network.PACHttpPort)
+                setSystemProxy(pacURL)
+        } else {
+                logTunnelEvent("ERROR", state.Host,
+                        fmt.Sprintf("Reconnection attempt %d failed", mc.reconnectAttempts))
+        }
+}
+
+// ---------------------------------------------------------------------------
+// startMonitoring — thin coordinator (was 280 lines, now ~30)
+// ---------------------------------------------------------------------------
+
+// startMonitoring starts a new monitoring loop for the current connection.
 func startMonitoring(state *ProxyState) {
-	var originalHostCheckTimer *time.Timer
+        monitoringMutex.Lock()
+        if monitoringActive {
+                monitoringMutex.Unlock()
+                return // already monitoring
+        }
+        monitoringActive = true
+        monitoringMutex.Unlock()
 
-	monitoringMutex.Lock()
-	if monitoringActive {
-		monitoringMutex.Unlock()
-		return // Already monitoring
-	}
-	monitoringActive = true
-	monitoringMutex.Unlock()
+        defer func() {
+                monitoringMutex.Lock()
+                monitoringActive = false
+                monitoringMutex.Unlock()
+        }()
 
-	defer func() {
-		monitoringMutex.Lock()
-		monitoringActive = false
-		monitoringMutex.Unlock()
-		if originalHostCheckTimer != nil {
-			originalHostCheckTimer.Stop()
-		}
-	}()
+        // Drain any leftover stop signals
+        select {
+        case <-monitoringStopChan:
+        default:
+        }
 
-	// Clear any existing stop signals
-	select {
-	case <-monitoringStopChan:
-	default:
-	}
+        mc := newMonitoringConfig()
+        ticker := time.NewTicker(1 * time.Second)
+        defer ticker.Stop()
 
-	// Configuration parameters - все теперь в секундах
-	socksCheckInterval := time.Duration(Config.Network.SocksCheckInterval) * time.Second
-	internetCheckDelay := time.Duration(Config.Network.InternetCheckDelay) * time.Second
-	internetCheckRetry := time.Duration(Config.Network.InternetCheckRetry) * time.Second
-	reconnectAttemptDelay := time.Duration(Config.Network.ReconnectAttemptDelay) * time.Second
-	maxReconnectTime := time.Duration(Config.Network.MaxReconnectTime) * time.Second
-	originalHostCheckInterval := time.Duration(Config.General.OriginalHostCheck) * time.Second
+        for {
+                select {
+                case <-monitoringStopChan:
+                        logTunnelEvent("INFO", state.Host, "Monitoring stopped")
+                        return
 
-	// Таймер для проверки оригинального хоста
-	if Config.General.ReturnToOriginalHost && state.IsFailoverActive {
-		originalHostCheckTimer = time.NewTimer(originalHostCheckInterval)
-	}
+                case <-ticker.C:
+                        // Check stop-flag file (written by -stop mode)
+                        if _, err := os.Stat(Config.TempFiles.StopFlag); err == nil {
+                                logTunnelEvent("INFO", state.Host, "Stop flag detected, monitoring stopped")
+                                return
+                        }
 
-	// State variables for this monitoring session
-	var (
-		isReconnecting       bool
-		isFatalError         bool
-		reconnectStartTime   time.Time
-		lastInternetCheck    time.Time
-		lastReconnectAttempt time.Time
-		lastSocksCheck       time.Time
-		networkAvailable     bool = true
-		reconnectAttempts    int
-	)
+                        // Periodic original-host return check (failover mode)
+                        if mc.checkOriginalHostReturn(state) {
+                                return
+                        }
 
-	// Main monitoring loop
-	for {
-		select {
-		case <-monitoringStopChan:
-			monitoringMutex.Lock()
-			monitoringActive = false
-			monitoringMutex.Unlock()
-			if originalHostCheckTimer != nil {
-				originalHostCheckTimer.Stop()
-			}
-			logTunnelEvent("INFO", state.Host, "Monitoring stopped")
-			return
-		default:
-			// Continue with monitoring
-		}
-
-		// Проверка таймера для оригинального хоста (если в режиме failover)
-		if originalHostCheckTimer != nil {
-			select {
-			case <-originalHostCheckTimer.C:
-				if Config.General.ReturnToOriginalHost && state.IsFailoverActive {
-					if checkAndReturnToOriginalHostFunc(state) {
-						// Успешно вернулись к оригинальному хосту, выходим из мониторинга
-						if originalHostCheckTimer != nil {
-							originalHostCheckTimer.Stop()
-						}
-						return
-					}
-					// Перезапускаем таймер
-					originalHostCheckTimer.Reset(originalHostCheckInterval)
-				}
-			default:
-				// Таймер еще не сработал
-			}
-		}
-
-		// Check for stop flag from system
-		if _, err := os.Stat(Config.TempFiles.StopFlag); err == nil {
-			monitoringMutex.Lock()
-			monitoringActive = false
-			monitoringMutex.Unlock()
-			if originalHostCheckTimer != nil {
-				originalHostCheckTimer.Stop()
-			}
-			logTunnelEvent("INFO", state.Host, "Stop flag detected, monitoring stopped")
-			return
-		}
-
-		// Handle fatal error state - only check SOCKS5 periodically
-		if isFatalError {
-			// In fatal error state, we just check SOCKS5 periodically
-			if time.Since(lastSocksCheck) >= socksCheckInterval {
-				lastSocksCheck = time.Now()
-				if checkProxyConnectivityFunc() {
-					// Tunnel recovered, exit fatal error state
-					isFatalError = false
-					isReconnecting = false
-					reconnectAttempts = 0
-					tunnelStartTime = time.Now()
-					isTunnelActive = true
-					logTunnelEvent("OK", state.Host, "Tunnel recovered from fatal error state")
-
-					// Update tray status for chain
-					if state.IsChain {
-						updateTrayStatusOnline("Chain", state.Host)
-					} else {
-						updateTrayStatusOnline(state.Host, state.RemoteHost)
-					}
-
-					updateMenuState()
-				}
-			}
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		// Normal monitoring - check SOCKS5 connectivity
-		if time.Since(lastSocksCheck) >= socksCheckInterval {
-			lastSocksCheck = time.Now()
-
-			if checkProxyConnectivityFunc() {
-				// Tunnel is online
-				if isReconnecting {
-					// Successfully reconnected
-					isReconnecting = false
-					reconnectAttempts = 0
-					tunnelStartTime = time.Now()
-					isTunnelActive = true
-					logTunnelEvent("OK", state.Host, "Tunnel reconnected successfully")
-					updateMenuState()
-				}
-				// Keep status online
-				continue
-			} else {
-				// Tunnel went offline
-				if !isReconnecting {
-					isReconnecting = true
-					reconnectStartTime = time.Now()
-					lastInternetCheck = time.Time{}
-					lastReconnectAttempt = time.Time{}
-					reconnectAttempts = 0
-					isTunnelActive = false
-					logTunnelEvent("ERROR", state.Host, "Tunnel lost connection")
-					updateMenuState()
-
-					// Проверяем, нужно ли использовать smart failover
-					if Config.General.SmartFailover && !state.IsChain {
-						// Пробуем умное переключение на другой хост
-						if handleSmartFailover(state) {
-							// Успешно переключились на другой хост, выходим из этого мониторинга
-							if originalHostCheckTimer != nil {
-								originalHostCheckTimer.Stop()
-							}
-							return
-						}
-					}
-
-					// Update tray status for chain
-					if state.IsChain {
-						updateTrayStatusReconnecting("Chain", state.Host)
-					} else {
-						updateTrayStatusReconnecting(state.Host, state.RemoteHost)
-					}
-
-					disableSystemProxy()
-					killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
-				}
-			}
-		}
-
-		// If not reconnecting, just wait for next check
-		if !isReconnecting {
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		// We are in reconnection state
-		// Check max reconnection time
-		if time.Since(reconnectStartTime) > maxReconnectTime {
-			logTunnelEvent("ERROR", state.Host,
-				fmt.Sprintf("Max reconnection time exceeded (%d seconds)", Config.Network.MaxReconnectTime))
-			handleFatalError(state.Host, state.RemoteHost)
-			isFatalError = true
-			isReconnecting = false
-			isTunnelActive = false
-			updateMenuState()
-			continue
-		}
-
-		// Check if we should wait for internet check delay
-		if time.Since(reconnectStartTime) < internetCheckDelay {
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		// Check internet connectivity (with retry interval)
-		if time.Since(lastInternetCheck) >= internetCheckRetry {
-			lastInternetCheck = time.Now()
-			networkAvailable = checkInternetFunc()
-
-			if !networkAvailable {
-				logTunnelEvent("WARN", state.Host, "No internet connectivity detected")
-
-				// Update tray status for chain
-				if state.IsChain {
-					updateTrayStatusNoInternet("Chain", state.Host, time.Since(reconnectStartTime), maxReconnectTime)
-				} else {
-					updateTrayStatusNoInternet(state.Host, state.RemoteHost, time.Since(reconnectStartTime), maxReconnectTime)
-				}
-
-				time.Sleep(1 * time.Second)
-				continue
-			}
-		} else if !networkAvailable {
-			// Still waiting for internet
-			if state.IsChain {
-				updateTrayStatusNoInternet("Chain", state.Host, time.Since(reconnectStartTime), maxReconnectTime)
-			} else {
-				updateTrayStatusNoInternet(state.Host, state.RemoteHost, time.Since(reconnectStartTime), maxReconnectTime)
-			}
-
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		// Internet is available, attempt to reconnect
-		if time.Since(lastReconnectAttempt) >= reconnectAttemptDelay {
-			lastReconnectAttempt = time.Now()
-			reconnectAttempts++
-
-			remainingTime := maxReconnectTime - time.Since(reconnectStartTime)
-
-			logTunnelEvent("INFO", state.Host,
-				fmt.Sprintf("Reconnection attempt %d (%.0f minutes remaining)",
-					reconnectAttempts, remainingTime.Minutes()))
-
-			if state.IsChain {
-				updateTrayStatusAttempting("Chain", state.Host, reconnectAttempts, remainingTime)
-			} else {
-				updateTrayStatusAttempting(state.Host, state.RemoteHost, reconnectAttempts, remainingTime)
-			}
-
-			if attemptTunnelRestartFunc(state) {
-				// Success!
-				isReconnecting = false
-				reconnectAttempts = 0
-				tunnelStartTime = time.Now()
-				isTunnelActive = true
-				logTunnelEvent("OK", state.Host, "Tunnel reestablished after reconnection")
-
-				// Update tray status for chain
-				if state.IsChain {
-					updateTrayStatusOnline("Chain", state.Host)
-				} else {
-					updateTrayStatusOnline(state.Host, state.RemoteHost)
-				}
-
-				updateMenuState()
-
-				// Re-enable system proxy
-				pacURL := fmt.Sprintf("http://127.0.0.1:%d/x_proxy.pac", Config.Network.PACHttpPort)
-				setSystemProxy(pacURL)
-				continue
-			} else {
-				logTunnelEvent("ERROR", state.Host,
-					fmt.Sprintf("Reconnection attempt %d failed", reconnectAttempts))
-			}
-		}
-
-		// Wait before next check
-		time.Sleep(1 * time.Second)
-	}
+                        // State machine
+                        switch {
+                        case mc.isFatalError:
+                                mc.handleFatalErrorState(state)
+                        case mc.isReconnecting:
+                                mc.handleReconnectionState(state)
+                        default:
+                                mc.handleNormalState(state)
+                        }
+                }
+        }
 }
 
-// stopMonitoring stops the current monitoring loop
+// ---------------------------------------------------------------------------
+// stopMonitoring
+// ---------------------------------------------------------------------------
+
+// stopMonitoring stops the current monitoring loop.
 func stopMonitoring() {
-	monitoringMutex.Lock()
-	defer monitoringMutex.Unlock()
+        monitoringMutex.Lock()
+        defer monitoringMutex.Unlock()
 
-	if monitoringActive {
-		select {
-		case monitoringStopChan <- true:
-			// Signal sent successfully
-		default:
-			// Channel already has a signal
-		}
-		monitoringActive = false
-	}
+        if monitoringActive {
+                select {
+                case monitoringStopChan <- true:
+                default:
+                }
+                monitoringActive = false
+        }
 }
 
-// checkAndRestoreExistingTunnel checks if a tunnel is already running and restores monitoring
+// ---------------------------------------------------------------------------
+// checkAndRestoreExistingTunnel
+// ---------------------------------------------------------------------------
+
+// checkAndRestoreExistingTunnel checks if a tunnel is already running and restores monitoring.
 func checkAndRestoreExistingTunnel() {
-	// Проверяем, существует ли PID файл и процесс жив
-	if !checkProcessRunning(Config.TempFiles.SSHTunnelPID) {
-		// Нет туннеля – пытаемся автосоединение
-		tryAutoConnectLastHost()
-		return
-	}
+        if !checkProcessRunning(Config.TempFiles.SSHTunnelPID) {
+                tryAutoConnectLastHost()
+                return
+        }
 
-	// Туннель существует – даём ему время на установку
-	// Ждём до 15 секунд, пока прокси не станет доступен
-	maxWait := 15 * time.Second
-	checkInterval := 500 * time.Millisecond
-	start := time.Now()
+        // Tunnel exists — wait up to 15s for it to become responsive
+        ticker := time.NewTicker(500 * time.Millisecond)
+        defer ticker.Stop()
+        timeout := time.After(15 * time.Second)
 
-	for {
-		if checkProxyConnectivity() {
-			// Прокси ответил – восстанавливаем состояние
-			state, err := LoadState()
-			if err == nil {
-				currentHost = state.Host
-				isTunnelActive = true
-				tunnelStartTime = time.Now() // приблизительно
-				updateMenuState()
-				if state.IsChain {
-					updateTrayStatusOnline("Chain", state.Host)
-				} else {
-					updateTrayStatusOnline(state.Host, state.RemoteHost)
-				}
-				go startMonitoring(state)
-				logTunnelEvent("INFO", state.Host, "Restored monitoring for existing tunnel")
-				return
-			}
-			// Если не удалось загрузить состояние – не страшно, просто выходим
-			logTunnelEvent("WARN", "unknown", "Tunnel active but state missing")
-			return
-		}
+        for {
+                select {
+                case <-timeout:
+                        logTunnelEvent("WARN", "unknown", "Existing tunnel not responding, killing process")
+                        killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
+                        tryAutoConnectLastHost()
+                        return
 
-		if time.Since(start) >= maxWait {
-			// Прокси так и не ответил – вероятно, процесс завис
-			logTunnelEvent("WARN", "unknown", "Existing tunnel not responding, killing process")
-			killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
-			break
-		}
-		time.Sleep(checkInterval)
-	}
-
-	// После убийства процесса пытаемся автосоединиться
-	tryAutoConnectLastHost()
+                case <-ticker.C:
+                        if checkProxyConnectivity() {
+                                state, err := LoadState()
+                                if err == nil {
+                                        connState.SetConnected(state.Host)
+                                        updateMenuState()
+                                        if state.IsChain {
+                                                updateTrayStatusOnline("Chain", state.Host)
+                                        } else {
+                                                updateTrayStatusOnline(state.Host, state.RemoteHost)
+                                        }
+                                        go startMonitoring(state)
+                                        logTunnelEvent("INFO", state.Host, "Restored monitoring for existing tunnel")
+                                } else {
+                                        logTunnelEvent("WARN", "unknown", "Tunnel active but state missing")
+                                }
+                                return
+                        }
+                }
+        }
 }
 
-// tryAutoConnectLastHost attempts to auto-connect to the last used host
+// ---------------------------------------------------------------------------
+// tryAutoConnectLastHost
+// ---------------------------------------------------------------------------
+
+// tryAutoConnectLastHost attempts to auto-connect to the last used host.
 func tryAutoConnectLastHost() {
-	if !Config.General.AutoConnect {
-		return
-	}
+        if !Config.General.AutoConnect {
+                return
+        }
 
-	lastHost := LoadLastHost()
-	if lastHost == "" {
-		return
-	}
+        lastHost := LoadLastHost()
+        if lastHost == "" {
+                return
+        }
 
-	// Check if lastHost is a chain (contains "|")
-	if strings.Contains(lastHost, "|") {
-		// This is a chain, try to restore the chain
-		chainNames := strings.Split(lastHost, "|")
-		hosts := parseSSHConfig(Config.Paths.SSHConfig)
+        // Check if lastHost is a chain (contains "|")
+        if strings.Contains(lastHost, "|") {
+                chainNames := strings.Split(lastHost, "|")
+                hosts := parseSSHConfig(Config.Paths.SSHConfig)
+                if len(hosts) == 0 {
+                        return
+                }
 
-		if len(hosts) == 0 {
-			return
-		}
+                var chain []HostConfig
+                for _, name := range chainNames {
+                        for _, host := range hosts {
+                                if host.Name == name {
+                                        chain = append(chain, host)
+                                        break
+                                }
+                        }
+                }
 
-		// Find all hosts in the chain
-		var chain []HostConfig
-		for _, name := range chainNames {
-			for _, host := range hosts {
-				if host.Name == name {
-					chain = append(chain, host)
-					break
-				}
-			}
-		}
+                if len(chain) > 0 {
+                        go func() {
+                                time.Sleep(2 * time.Second)
+                                chainDisplay := strings.Join(chainNames, " -> ")
+                                establishConnection(ConnectOptions{
+                                        Hosts:              chain,
+                                        IsChain:            true,
+                                        OriginalHost:       chainDisplay,
+                                        KillExistingTunnel: true,
+                                        EnableSystemProxy:  true,
+                                        SaveLastHost:       true,
+                                        StartMonitoring:    true,
+                                        UpdateTray:         true,
+                                        DisplayAlias:       "Chain",
+                                        DisplayTooltip:     chainDisplay,
+                                })
+                        }()
+                }
+        } else {
+                hosts := parseSSHConfig(Config.Paths.SSHConfig)
+                if len(hosts) == 0 {
+                        return
+                }
 
-		if len(chain) > 0 {
-			// Connect to the chain (auto‑connect, not manual)
-			go func() {
-				time.Sleep(2 * time.Second)         // Small delay for system to initialize
-				handleChainConnection(chain, false) // false = auto‑connect
-			}()
-		}
-	} else {
-		// Single host (original behavior)
-		hosts := parseSSHConfig(Config.Paths.SSHConfig)
-		if len(hosts) == 0 {
-			return
-		}
-
-		// Find the last host in config
-		for _, host := range hosts {
-			if host.Name == lastHost {
-				// Check if it's in first group (for consistency)
-				firstGroup := hosts[0].Group
-				if host.Group == firstGroup {
-					go func(h HostConfig) {
-						time.Sleep(2 * time.Second) // Small delay for system to initialize
-						handleHostClick(h)
-					}(host)
-				}
-				break
-			}
-		}
-	}
+                for _, host := range hosts {
+                        if host.Name == lastHost {
+                                firstGroup := hosts[0].Group
+                                if host.Group == firstGroup {
+                                        go func(h HostConfig) {
+                                                time.Sleep(2 * time.Second)
+                                                handleHostClick(h)
+                                        }(host)
+                                }
+                                break
+                        }
+                }
+        }
 }
 
-// handleChainConnection establishes connection to a chain of hosts (used by tray)
-// manual: true when called from user click, false when called from auto‑connect
-func handleChainConnection(chain []HostConfig, manual bool) {
-	if len(chain) == 0 {
-		return
-	}
 
-	// Check if we're already connected to this chain
-	var chainNames []string
-	for _, host := range chain {
-		chainNames = append(chainNames, host.Name)
-	}
-	chainStr := strings.Join(chainNames, " -> ")
-
-	if isTunnelActive && currentHost == chainStr {
-		// Already connected to this chain, ignore
-		return
-	}
-
-	if manual {
-		logTunnelEvent("INFO", chainStr, fmt.Sprintf("User clicked to connect to chain: %s", chainStr))
-	} else {
-		logTunnelEvent("INFO", chainStr, "Auto-connecting to chain")
-	}
-
-	// Stop current monitoring if active
-	stopMonitoring()
-
-	// Kill any existing tunnel
-	killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
-	time.Sleep(500 * time.Millisecond) // Short delay to ensure process is killed
-
-	// Connect to the selected chain
-
-	// Load SSH-KEY-PASS from file
-	sshKeyPass := loadSSHKeyPassphrase()
-
-	// Resolve SSH-KEY path
-	sshKeyPath := resolveSSHKeyPath(Config.Paths.WorkDir, chain[0].IdentityFile)
-
-	// Load SSH-KEY into agent with SSH-KEY-PASS
-	ensureSSHAgent(sshKeyPath, sshKeyPass)
-
-	sshCmd := buildSSHCommand(chain, sshKeyPath)
-
-	// Use startSSHTunnelWithRetries with correct chain length
-	if startSSHTunnelWithRetries(sshCmd, len(chain)) {
-		state := ProxyState{
-			IsChain:          true,
-			Host:             chainStr,
-			OriginalHost:     chainStr,
-			IsFailoverActive: false,
-			ChainHosts:       chainNames,
-			ProxyPort:        Config.Network.ProxyPort,
-			KeyPath:          sshKeyPath,
-			SSHCommand:       sshCmd,
-			RemoteHost:       chain[len(chain)-1].HostName,
-		}
-		SaveState(state)
-		SaveLastHost(strings.Join(chainNames, "|"))
-		startPACServer()
-		pacURL := fmt.Sprintf("http://127.0.0.1:%d/x_proxy.pac", Config.Network.PACHttpPort)
-		setSystemProxy(pacURL)
-
-		// Update state
-		currentHost = chainStr
-		isTunnelActive = true
-		tunnelStartTime = time.Now()
-
-		// Update menu
-		updateMenuState()
-
-		// Update tray icon and title
-		updateTrayStatusOnline("Chain", chainStr)
-
-		// Start monitoring for this connection
-		go startMonitoring(&state)
-	} else {
-		logTunnelEvent("ERROR", chainStr, "Chain connection failed")
-		// Reset icon to yellow
-		updateTrayStatusReconnecting("Chain", chainStr)
-	}
-}

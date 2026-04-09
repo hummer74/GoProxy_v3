@@ -154,7 +154,10 @@ func addKeyToAgent(keyPath, passphrase string) bool {
 
 // trySSHAdd attempts to add SSH-KEY using ssh-add (legacy support)
 func trySSHAdd(sshKeyPath, sshKeyPass string) bool {
-    cmd := exec.Command("ssh-add", sshKeyPath)
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+
+    cmd := exec.CommandContext(ctx, "ssh-add", sshKeyPath)
 
     if sshKeyPass != "" {
         tempDir := os.TempDir()
@@ -175,6 +178,11 @@ func trySSHAdd(sshKeyPath, sshKeyPass string) bool {
     cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
     output, err := cmd.CombinedOutput()
     outputStr := string(output)
+
+    if ctx.Err() == context.DeadlineExceeded {
+        logTunnelEvent("ERROR", "SSH-Agent", "trySSHAdd timed out (prevented indefinite hang)")
+        return false
+    }
 
     if err == nil {
         return true

@@ -14,14 +14,12 @@ import (
 
 // Global variables for menu and monitoring
 var (
-    currentHost        string // Currently connected host
-    isTunnelActive     bool   // Tunnel activity flag
+    // Tunnel connection state is managed by connState (see connection_state.go)
     monitoringActive   bool   // Monitoring activity flag
     monitoringMutex    sync.Mutex
     monitoringStopChan chan bool
     menuUpdateTicker   *time.Ticker
     hostsCheckTicker   *time.Ticker // Ticker for periodic hosts checking
-    tunnelStartTime    time.Time
 )
 
 // runTrayMode runs the system tray application

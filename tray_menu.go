@@ -213,8 +213,9 @@ func handleChainToggle(host HostConfig) {
     }
 
     // Check if this host is part of an active chain connection — ignore click
-    if isTunnelActive && strings.Contains(currentHost, " -> ") {
-        chainParts := strings.Split(currentHost, " -> ")
+    currentHostVal := connState.GetHost()
+    if connState.IsActive() && strings.Contains(currentHostVal, " -> ") {
+        chainParts := strings.Split(currentHostVal, " -> ")
         for _, part := range chainParts {
             if part == host.Name {
                 return
@@ -223,7 +224,7 @@ func handleChainToggle(host HostConfig) {
     }
 
     // Check if this is the currently active single host (ignore click)
-    if isTunnelActive && !strings.Contains(currentHost, " -> ") && currentHost == host.Name {
+    if connState.IsActive() && !strings.Contains(currentHostVal, " -> ") && currentHostVal == host.Name {
         return
     }
 
@@ -318,8 +319,9 @@ func updateChainBuilderUI() {
 
     // Build set of active chain hosts (if chain is connected)
     activeChainSet := make(map[string]bool)
-    if isTunnelActive && strings.Contains(currentHost, " -> ") {
-        for _, part := range strings.Split(currentHost, " -> ") {
+    currentHostVal := connState.GetHost()
+    if connState.IsActive() && strings.Contains(currentHostVal, " -> ") {
+        for _, part := range strings.Split(currentHostVal, " -> ") {
             activeChainSet[part] = true
         }
     }
@@ -346,7 +348,7 @@ func updateChainBuilderUI() {
         menuItem.Show()
 
         // Skip currently connected single host — handled by updateMenuState
-        if isTunnelActive && !strings.Contains(currentHost, " -> ") && host.Name == currentHost {
+        if connState.IsActive() && !strings.Contains(currentHostVal, " -> ") && host.Name == currentHostVal {
             continue
         }
 
@@ -432,8 +434,9 @@ func updateHostStatusInMenu(hosts []HostConfig, initialCheck bool) {
 
     // Build set of active chain hosts (if chain is connected)
     activeChainSet := make(map[string]bool)
-    if isTunnelActive && strings.Contains(currentHost, " -> ") {
-        for _, part := range strings.Split(currentHost, " -> ") {
+    currentHostVal := connState.GetHost()
+    if connState.IsActive() && strings.Contains(currentHostVal, " -> ") {
+        for _, part := range strings.Split(currentHostVal, " -> ") {
             activeChainSet[part] = true
         }
     }
@@ -451,14 +454,14 @@ func updateHostStatusInMenu(hosts []HostConfig, initialCheck bool) {
         paddedName := padRight(host.Name, maxLength)
 
         // Skip updating if this host is currently connected (it will be handled by updateMenuState)
-        if isTunnelActive {
-            if strings.Contains(currentHost, " -> ") {
+        if connState.IsActive() {
+            if strings.Contains(currentHostVal, " -> ") {
                 // Current connection is a chain, skip all chain hosts
                 if activeChainSet[host.Name] {
                     hostStatusCache.Set(host.Name, true)
                     continue
                 }
-            } else if host.Name == currentHost {
+            } else if host.Name == currentHostVal {
                 // This is the currently connected single host
                 hostStatusCache.Set(host.Name, true)
                 continue
@@ -517,10 +520,11 @@ func updateMenuState() {
     var chainParts []string
     chainHostSet := make(map[string]bool)
     lastChainHost := ""
-    if isTunnelActive && currentHost != "" {
-        if strings.Contains(currentHost, " -> ") {
+    currentHostVal := connState.GetHost()
+    if connState.IsActive() && currentHostVal != "" {
+        if strings.Contains(currentHostVal, " -> ") {
             isChain = true
-            chainParts = strings.Split(currentHost, " -> ")
+            chainParts = strings.Split(currentHostVal, " -> ")
             for _, h := range chainParts {
                 chainHostSet[h] = true
             }
@@ -554,27 +558,28 @@ func updateMenuState() {
                     // Exit host: ✓ ● [N] alias (HH:MM)
                     item.Check()
                     item.Enable()
-                    if !tunnelStartTime.IsZero() {
-                        duration := time.Since(tunnelStartTime)
+                    startedTime := connState.GetStartTime()
+                    if !startedTime.IsZero() {
+                        duration := time.Since(startedTime)
                         durationStr := formatDuration(duration)
                         item.SetTitle(fmt.Sprintf("%s %s %s (%s)", GreenCircle, posStr, paddedName, durationStr))
-                        item.SetTooltip(fmt.Sprintf("Chain exit: %s\nConnected for: %s", currentHost, durationStr))
+                        item.SetTooltip(fmt.Sprintf("Chain exit: %s\nConnected for: %s", currentHostVal, durationStr))
                     } else {
                         item.SetTitle(fmt.Sprintf("%s %s %s", GreenCircle, posStr, paddedName))
-                        item.SetTooltip(fmt.Sprintf("Chain exit: %s", currentHost))
+                        item.SetTooltip(fmt.Sprintf("Chain exit: %s", currentHostVal))
                     }
                 } else if pos == 1 {
                     // Entry host: ✓ ● [1] alias
                     item.Check()
                     item.Enable()
                     item.SetTitle(fmt.Sprintf("%s %s %s", RedCircle, posStr, paddedName))
-                    item.SetTooltip(fmt.Sprintf("Chain entry → %s", currentHost))
+                    item.SetTooltip(fmt.Sprintf("Chain entry → %s", currentHostVal))
                 } else {
                     // Intermediate host: ☐ → [N] alias
                     item.Uncheck()
                     item.Enable()
                     item.SetTitle(fmt.Sprintf("%s %s %s", CurrentArrow, posStr, paddedName))
-                    item.SetTooltip(fmt.Sprintf("Chain hop %d → %s", pos, currentHost))
+                    item.SetTooltip(fmt.Sprintf("Chain hop %d → %s", pos, currentHostVal))
                 }
                 item.Show()
             } else {
@@ -617,11 +622,12 @@ func updateMenuState() {
         // Make sure item is visible
         menuItem.Show()
 
-        if !isChain && isTunnelActive && hostName == currentHost {
+        if !isChain && connState.IsActive() && hostName == currentHostVal {
             // Single host connection
             menuItem.Check()
-            if !tunnelStartTime.IsZero() {
-                duration := time.Since(tunnelStartTime)
+            startedTime := connState.GetStartTime()
+            if !startedTime.IsZero() {
+                duration := time.Since(startedTime)
                 durationStr := formatDuration(duration)
                 menuItem.SetTitle(fmt.Sprintf("%s %s (%s)", CurrentArrow, padRight(hostName, maxLength), durationStr))
                 menuItem.SetTooltip(fmt.Sprintf("Currently connected to %s for %s", hostName, durationStr))
@@ -678,7 +684,7 @@ func menuUpdateLoop() {
 
     for range menuUpdateTicker.C {
         // Update menu if tunnel is active (to update duration)
-        if isTunnelActive {
+        if connState.IsActive() {
             updateMenuState()
         }
     }
