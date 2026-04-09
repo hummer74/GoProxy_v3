@@ -14,29 +14,21 @@ import (
 
 // handleHostClick handles clicks on host menu items
 func handleHostClick(host HostConfig) {
+    debugLog("HANDLER", "Host click: %s", host.Name)
     // Check if we're already connected to this host
-    if isTunnelActive && currentHost == host.Name {
-        // Already connected to this host, ignore click
+    if connState.IsActive() && connState.GetHost() == host.Name {
         return
     }
 
     // Check if host is available before attempting connection
     if status, exists := hostStatusCache.Get(host.Name); exists && !status {
-        // Host is marked as unavailable, don't try to connect
         logTunnelEvent("WARN", host.Name, "Attempted to connect to unavailable host")
         return
     }
 
     logTunnelEvent("INFO", host.Name, fmt.Sprintf("User clicked to connect to host: %s", host.HostName))
 
-    // Stop current monitoring if active
-    stopMonitoring()
-
-    // Kill any existing tunnel
-    killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
-    time.Sleep(500 * time.Millisecond) // Short delay to ensure process is killed
-
-    // Connect to the selected host
+    // Show connecting state in tray
     iconData := loadIconData(color.RGBA{255, 255, 0, 255})
     if iconData != nil {
         systray.SetIcon(iconData)
@@ -44,50 +36,19 @@ func handleHostClick(host HostConfig) {
     systray.SetTitle(fmt.Sprintf("Connecting to %s...", host.Name))
     systray.SetTooltip(fmt.Sprintf("Connecting to %s...", host.Name))
 
-    // Load SSH-KEY-PASS from file
-    sshKeyPass := loadSSHKeyPassphrase()
+    result := establishConnection(ConnectOptions{
+        Hosts:              []HostConfig{host},
+        OriginalHost:       host.Name,
+        StopMonitoring:     true,
+        KillExistingTunnel: true,
+        EnableSystemProxy:  true,
+        SaveLastHost:       true,
+        StartMonitoring:    true,
+        UpdateTray:         true,
+    })
 
-    // Resolve SSH-KEY path
-    sshKeyPath := resolveSSHKeyPath(Config.Paths.WorkDir, host.IdentityFile)
-
-    // Load SSH-KEY into agent with SSH-KEY-PASS
-    ensureSSHAgent(sshKeyPath, sshKeyPass)
-
-    sshCmd := buildSSHCommand([]HostConfig{host}, sshKeyPath)
-
-    if startSSHTunnel(sshCmd) {
-        state := ProxyState{
-            IsChain:          false,
-            Host:             host.Name,
-            OriginalHost:     host.Name, // Сохраняем как оригинальный хост
-            IsFailoverActive: false,     // Не failover, пользователь выбрал вручную
-            ProxyPort:        Config.Network.ProxyPort,
-            KeyPath:          sshKeyPath,
-            SSHCommand:       sshCmd,
-            RemoteHost:       host.HostName,
-        }
-        SaveState(state)
-        SaveLastHost(host.Name)
-        startPACServer()
-        pacURL := fmt.Sprintf("http://127.0.0.1:%d/x_proxy.pac", Config.Network.PACHttpPort)
-        setSystemProxy(pacURL)
-
-        // Update state
-        currentHost = host.Name
-        isTunnelActive = true
-        tunnelStartTime = time.Now()
-
-        // Update menu
-        updateMenuState()
-
-        // Update tray icon and title
-        updateTrayStatusOnline(host.Name, host.HostName)
-
-        // Start monitoring for this connection
-        go startMonitoring(&state)
-    } else {
-        logTunnelEvent("ERROR", host.Name, "Connection failed")
-        // Reset icon to yellow
+    if result == nil {
+        // Connection failed — tray already shows failed state from pipeline
         iconData := loadIconData(color.RGBA{255, 255, 0, 255})
         if iconData != nil {
             systray.SetIcon(iconData)
@@ -97,14 +58,92 @@ func handleHostClick(host HostConfig) {
     }
 }
 
-// Function hooks for tray/UI operations
+// handleReverseHostClick handles clicks on reverse tunnel hosts (hosts with ProxyJump).
+// Automatically resolves the ProxyJump chain and connects immediately in one click.
+func handleReverseHostClick(host HostConfig) {
+    debugLog("HANDLER", "Reverse host click: %s (ProxyJump: %s)", host.Name, host.ProxyJump)
+    // Check if already connected to this host
+    currentHostVal := connState.GetHost()
+    if connState.IsActive() && strings.Contains(currentHostVal, " -> ") {
+        chainParts := strings.Split(currentHostVal, " -> ")
+        for _, part := range chainParts {
+            if part == host.Name {
+                return // Already connected via this host
+            }
+        }
+    }
+    if connState.IsActive() && currentHostVal == host.Name {
+        return
+    }
+
+    // Check availability (reverse hosts check via their ProxyJump target)
+    if status, exists := hostStatusCache.Get(host.Name); exists && !status {
+        logTunnelEvent("WARN", host.Name, "Attempted to connect to unavailable reverse host")
+        return
+    }
+
+    // Resolve ProxyJump target from parsed hosts
+    var jumper *HostConfig
+    for i := range allMenuHosts {
+        if allMenuHosts[i].Name == host.ProxyJump {
+            jumper = &allMenuHosts[i]
+            break
+        }
+    }
+
+    if jumper == nil {
+        // ProxyJump target not found in config — fall back to single host connection
+        logTunnelEvent("WARN", host.Name,
+            fmt.Sprintf("ProxyJump target '%s' not found, falling back to direct connection", host.ProxyJump))
+        handleHostClick(host)
+        return
+    }
+
+    // Build auto-resolved chain: [jumper, target]
+    chain := []HostConfig{*jumper, host}
+    chainDisplay := fmt.Sprintf("%s -> %s", jumper.Name, host.Name)
+
+    logTunnelEvent("INFO", chainDisplay,
+        fmt.Sprintf("Auto-resolved reverse host connection: %s (via ProxyJump %s)", host.Name, host.ProxyJump))
+
+    // Show connecting state in tray
+    iconData := loadIconData(color.RGBA{255, 255, 0, 255})
+    if iconData != nil {
+        systray.SetIcon(iconData)
+    }
+    systray.SetTitle(fmt.Sprintf("Connecting to %s...", host.Name))
+    systray.SetTooltip(fmt.Sprintf("Connecting via %s → %s...", jumper.Name, host.Name))
+
+    // Connect as chain with ProxyJump auto-resolution
+    result := establishConnection(ConnectOptions{
+        Hosts:              chain,
+        IsChain:            true,
+        OriginalHost:       chainDisplay,
+        StopMonitoring:     true,
+        KillExistingTunnel: true,
+        EnableSystemProxy:  true,
+        SaveLastHost:       true,
+        StartMonitoring:    true,
+        UpdateTray:         true,
+        DisplayAlias:       host.Name,                                          // Show reverse host name in tray
+        DisplayTooltip:     fmt.Sprintf("via %s → %s:%s", jumper.Name, host.HostName, host.Port),
+    })
+
+    if result == nil {
+        logTunnelEvent("ERROR", chainDisplay, "Reverse host connection failed")
+        systray.SetTitle("Connection failed")
+        systray.SetTooltip(fmt.Sprintf("Failed to connect to %s via %s", host.Name, jumper.Name))
+    }
+}
+
+// Function hooks for tray/UI operations (used in tests and by monitoring)
 var updateTrayStatusOnlineFn = updateTrayStatusOnline
 var updateMenuStateFn = updateMenuState
 
 // handleSmartFailover выполняет умное переключение на самый быстрый доступный хост
 func handleSmartFailover(currentState *ProxyState) bool {
+    debugLog("HANDLER", "Smart failover from: %s", currentState.Host)
     if !Config.General.SmartFailover || currentState.IsChain {
-        // Smart failover отключен или это цепочка - не используем умное переключение
         return false
     }
 
@@ -123,10 +162,10 @@ func handleSmartFailover(currentState *ProxyState) bool {
         }
     }
 
-    // Исключаем текущий хост из поиска
+    // Исключаем текущий хост и реверсивные хосты (они идут через джампер)
     var availableHosts []HostConfig
     for _, host := range firstGroupHosts {
-        if host.Name != currentState.OriginalHost && host.Name != currentState.Host {
+        if host.Name != currentState.OriginalHost && host.Name != currentState.Host && !isReverseHost(host) {
             availableHosts = append(availableHosts, host)
         }
     }
@@ -145,57 +184,26 @@ func handleSmartFailover(currentState *ProxyState) bool {
         return false
     }
 
-    // Преобразуем наносекунды в секунды для логирования
     responseTimeSec := responseTime.Seconds()
     logTunnelEvent("INFO", currentState.Host,
         fmt.Sprintf("Fastest host found: %s (response time: %.2f seconds)", fastestHost.Name, responseTimeSec))
 
-    // Подключаемся к найденному хосту
-    sshKeyPass := loadSSHKeyPassphrase()
-    sshKeyPath := resolveSSHKeyPath(Config.Paths.WorkDir, fastestHost.IdentityFile)
+    result := establishConnection(ConnectOptions{
+        Hosts:              []HostConfig{*fastestHost},
+        OriginalHost:       currentState.OriginalHost,
+        IsFailoverActive:   true,
+        FailoverStart:      time.Now().Format(time.RFC3339),
+        StopMonitoring:     true,
+        KillExistingTunnel: true,
+        EnableSystemProxy:  false, // proxy already set, we're switching
+        SaveLastHost:       false,
+        StartMonitoring:    true,
+        UpdateTray:         true,
+        DisplayAlias:       fastestHost.Name,
+        DisplayTooltip:     fastestHost.HostName,
+    })
 
-    // Load SSH-KEY into agent with SSH-KEY-PASS
-    ensureSSHAgent(sshKeyPath, sshKeyPass)
-
-    sshCmd := buildSSHCommand([]HostConfig{*fastestHost}, sshKeyPath)
-
-    // Останавливаем текущий мониторинг
-    stopMonitoring()
-
-    // Убиваем текущий туннель
-    killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
-    time.Sleep(500 * time.Millisecond)
-
-    if startSSHTunnelFn(sshCmd) {
-        // Обновляем состояние
-        newState := ProxyState{
-            IsChain:          false,
-            Host:             fastestHost.Name,
-            OriginalHost:     currentState.OriginalHost, // Сохраняем оригинальный хост
-            IsFailoverActive: true,                      // Помечаем как failover
-            FailoverStart:    time.Now().Format(time.RFC3339),
-            ProxyPort:        Config.Network.ProxyPort,
-            KeyPath:          sshKeyPath,
-            SSHCommand:       sshCmd,
-            RemoteHost:       fastestHost.HostName,
-        }
-
-        SaveState(newState)
-
-        // Обновляем глобальное состояние
-        currentHost = fastestHost.Name
-        isTunnelActive = true
-        tunnelStartTime = time.Now()
-
-        // Обновляем меню
-        updateMenuStateFn()
-
-        // Обновляем иконку и заголовок в трее
-        updateTrayStatusOnlineFn(fastestHost.Name, fastestHost.HostName+" (Failover)")
-
-        // Запускаем мониторинг для нового подключения
-        go startMonitoring(&newState)
-
+    if result != nil {
         logTunnelEvent("OK", currentState.Host,
             fmt.Sprintf("Smart failover completed: switched to %s", fastestHost.Name))
         return true
@@ -207,7 +215,6 @@ func handleSmartFailover(currentState *ProxyState) bool {
 // checkAndReturnToOriginalHost проверяет оригинальный хост и возвращается к нему если доступен
 func checkAndReturnToOriginalHost(currentState *ProxyState) bool {
     if !Config.General.ReturnToOriginalHost || !currentState.IsFailoverActive {
-        // Возврат к оригинальному хосту отключен или мы не в режиме failover
         return false
     }
 
@@ -236,63 +243,32 @@ func checkAndReturnToOriginalHost(currentState *ProxyState) bool {
 
     available, responseTime := checkSSHConnectionWithTime(*originalHostConfig, Config.Paths.WorkDir)
 
-    if available {
-        // Преобразуем наносекунды в секунды для логирования
-        responseTimeSec := responseTime.Seconds()
-        logTunnelEvent("INFO", currentState.Host,
-            fmt.Sprintf("Original host %s is available (response time: %.2f seconds)",
-                currentState.OriginalHost, responseTimeSec))
+    if !available {
+        return false
+    }
 
-        // Подключаемся обратно к оригинальному хосту
-        sshKeyPass := loadSSHKeyPassphrase()
-        sshKeyPath := resolveSSHKeyPath(Config.Paths.WorkDir, originalHostConfig.IdentityFile)
+    responseTimeSec := responseTime.Seconds()
+    logTunnelEvent("INFO", currentState.Host,
+        fmt.Sprintf("Original host %s is available (response time: %.2f seconds)",
+            currentState.OriginalHost, responseTimeSec))
 
-        // Load SSH-KEY into agent with SSH-KEY-PASS
-        ensureSSHAgent(sshKeyPath, sshKeyPass)
+    result := establishConnection(ConnectOptions{
+        Hosts:              []HostConfig{*originalHostConfig},
+        OriginalHost:       originalHostConfig.Name,
+        StopMonitoring:     true,
+        KillExistingTunnel: true,
+        EnableSystemProxy:  true,
+        SaveLastHost:       true,
+        StartMonitoring:    true,
+        UpdateTray:         true,
+        DisplayAlias:       originalHostConfig.Name,
+        DisplayTooltip:     originalHostConfig.HostName,
+    })
 
-        sshCmd := buildSSHCommand([]HostConfig{*originalHostConfig}, sshKeyPath)
-
-        // Останавливаем текущий мониторинг
-        stopMonitoring()
-
-        // Убиваем текущий туннель
-        killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
-        time.Sleep(500 * time.Millisecond)
-
-        if startSSHTunnel(sshCmd) {
-            // Обновляем состояние
-            newState := ProxyState{
-                IsChain:          false,
-                Host:             originalHostConfig.Name,
-                OriginalHost:     originalHostConfig.Name, // Обновляем оригинальный хост
-                IsFailoverActive: false,                   // Больше не в режиме failover
-                ProxyPort:        Config.Network.ProxyPort,
-                KeyPath:          sshKeyPath,
-                SSHCommand:       sshCmd,
-                RemoteHost:       originalHostConfig.HostName,
-            }
-
-            SaveState(newState)
-            SaveLastHost(originalHostConfig.Name)
-
-            // Обновляем глобальное состояние
-            currentHost = originalHostConfig.Name
-            isTunnelActive = true
-            tunnelStartTime = time.Now()
-
-            // Обновляем меню
-            updateMenuState()
-
-            // Обновляем иконку и заголовок в трее
-            updateTrayStatusOnline(originalHostConfig.Name, originalHostConfig.HostName)
-
-            // Запускаем мониторинг для нового подключения
-            go startMonitoring(&newState)
-
-            logTunnelEvent("OK", currentState.Host,
-                fmt.Sprintf("Returned to original host: %s", originalHostConfig.Name))
-            return true
-        }
+    if result != nil {
+        logTunnelEvent("OK", currentState.Host,
+            fmt.Sprintf("Returned to original host: %s", originalHostConfig.Name))
+        return true
     }
 
     return false
@@ -301,9 +277,15 @@ func checkAndReturnToOriginalHost(currentState *ProxyState) bool {
 // handleConnectChain handles the "Connect Chain" button click
 func handleConnectChain() {
     chain := getChainBuilderCopy()
+    debugLog("HANDLER", "Connect chain: %d hosts", len(chain))
     if len(chain) == 0 {
         return
     }
+
+    // Snapshot and clear immediately to prevent TOCTOU:
+    // another click could modify the builder while we're connecting.
+    clearChainBuilder()
+    updateChainBuilderUI()
 
     // Build chain display string for logging
     var names []string
@@ -318,13 +300,26 @@ func handleConnectChain() {
         // Single host — use direct connection
         handleHostClick(chain[0])
     } else {
-        // Multiple hosts — use chain connection
-        handleChainConnection(chain, true) // true = manual (user clicked Connect)
-    }
+        // Multiple hosts — use chain connection via pipeline
+        result := establishConnection(ConnectOptions{
+            Hosts:              chain,
+            IsChain:            true,
+            OriginalHost:       chainDisplay,
+            StopMonitoring:     true,
+            KillExistingTunnel: true,
+            EnableSystemProxy:  true,
+            SaveLastHost:       true,
+            StartMonitoring:    true,
+            UpdateTray:         true,
+            DisplayAlias:       "Chain",
+            DisplayTooltip:     chainDisplay,
+        })
 
-    // Clear chain builder after connection attempt
-    clearChainBuilder()
-    updateChainBuilderUI()
+        if result == nil {
+            logTunnelEvent("ERROR", chainDisplay, "Chain connection failed")
+            updateTrayStatusReconnecting("Chain", chainDisplay)
+        }
+    }
 }
 
 // handleClearChain handles the "Clear Selection" button click
@@ -347,18 +342,13 @@ func handleClearChain() {
 
 // handleKillProxy handles the Kill Proxy menu item
 func handleKillProxy() {
-    logTunnelEvent("INFO", currentHost, "User requested to kill proxy")
+    debugLog("HANDLER", "Kill proxy")
+    logTunnelEvent("INFO", connState.GetHost(), "User requested to kill proxy")
 
-    // Stop monitoring first
     stopMonitoring()
-
-    // Disable system proxy
     disableSystemProxy()
-
-    // Kill all tunnel processes
     killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
 
-    // Set red icon
     iconData := loadIconData(color.RGBA{255, 0, 0, 255})
     if iconData != nil {
         systray.SetIcon(iconData)
@@ -366,84 +356,55 @@ func handleKillProxy() {
     systray.SetTitle("Proxy Killed")
     systray.SetTooltip("Proxy has been killed. Select a host to connect.")
 
-    // Reset state
-    currentHost = ""
-    isTunnelActive = false
-    tunnelStartTime = time.Time{}
-
-    // Update menu - all hosts should be clickable now
+    connState.SetDisconnected()
     updateMenuState()
 }
 
-// handleExit handles the Exit menu item - performs full cleanup using stop mode
+// handleExit handles the Exit menu item - performs full cleanup inline
 func handleExit() {
-    logTunnelEvent("INFO", currentHost, "User requested exit")
+    debugLog("HANDLER", "Exit")
+    logTunnelEvent("INFO", connState.GetHost(), "User requested exit")
 
-    // Stop monitoring first
     stopMonitoring()
 
-    // Create stop flag for Tray (this will be read by monitoring loops)
-    os.WriteFile(Config.TempFiles.StopFlag, []byte("stop"), 0644)
+    // Kill SSH tunnel
+    killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
 
-    // Get current executable path
-    execPath, err := os.Executable()
-    if err != nil {
-        // Fallback: try to clean up manually
-        cleanupOnExitFallback()
-        return
-    }
+    // Stop PAC server
+    stopPACServer()
 
-    // Start a new process in stop mode to ensure proper cleanup
-    cmd := exec.Command(execPath, "-stop")
-    cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-
-    // Start the process (don't wait for it to finish)
-    if err := cmd.Start(); err != nil {
-        // If we can't start the stop process, fall back to manual cleanup
-        cleanupOnExitFallback()
-    }
-
-    // Stop menu update ticker
-    if menuUpdateTicker != nil {
-        menuUpdateTicker.Stop()
-    }
-
-    // Stop hosts check ticker
-    if hostsCheckTicker != nil {
-        hostsCheckTicker.Stop()
-    }
-
-    // Quit tray immediately - stop process will handle cleanup
-    systray.Quit()
-}
-
-// cleanupOnExitFallback is used when we can't start the stop process
-func cleanupOnExitFallback() {
     // Disable system proxy
     disableSystemProxy()
 
-    // Stop all processes
-    killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
-    killProcessByFile(Config.TempFiles.PACServerPID, "PAC HTTP Server")
+    // Clean up all temp files
+    cleanupTempFiles()
 
-    // Wait a bit for processes to exit
-    time.Sleep(2 * time.Second)
-
-    // Clean up PID file
-    os.Remove(Config.TempFiles.TrayPID)
-
-    // Stop menu update ticker
+    // Stop tickers
     if menuUpdateTicker != nil {
         menuUpdateTicker.Stop()
     }
-
-    // Stop hosts check ticker
     if hostsCheckTicker != nil {
         hostsCheckTicker.Stop()
     }
 
-    // Quit tray
+    time.Sleep(500 * time.Millisecond)
     systray.Quit()
+}
+
+// cleanupTempFiles removes all GoProxy temp files
+func cleanupTempFiles() {
+    debugLog("HANDLER", "Cleaning up temp files")
+    files := []string{
+        Config.TempFiles.PACFile,
+        Config.TempFiles.StateFile,
+        Config.TempFiles.SSHTunnelPID,
+        Config.TempFiles.TrayPID,
+        Config.TempFiles.PACServerPID,
+        Config.TempFiles.StopFlag,
+    }
+    for _, f := range files {
+        os.Remove(f)
+    }
 }
 
 // handleFatalError handles fatal error state with 60-minute timeout
@@ -457,28 +418,23 @@ func handleFatalError(remoteAlias, displayHost string) {
     systray.SetTitle("FATAL ERROR")
     systray.SetTooltip(fmt.Sprintf("%s: RECONNECT_TIMEOUT (60m)\n%s", remoteAlias, displayHost))
 
-    // Disable system proxy
     disableSystemProxy()
-
-    // Kill any existing tunnel process
     killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
 }
 
 // attemptTunnelRestart attempts to restart SSH tunnel (single attempt)
+// This is a special case: it reuses the existing SSHCommand from state
+// and waits for the tunnel to come up, without going through the full pipeline.
 func attemptTunnelRestart(state *ProxyState) bool {
-    // Kill any existing tunnel process
     killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
     time.Sleep(1 * time.Second)
 
-    // Load SSH-KEY-PASS from file
     sshKeyPass := loadSSHKeyPassphrase()
 
-    // Ensure SSH agent has the SSH-KEY
     if !ensureSSHAgent(state.KeyPath, sshKeyPass) {
         logTunnelEvent("WARN", state.Host, "SSH agent SSH-KEY loading failed during restart")
     }
 
-    // Build and start SSH command
     cmd := exec.Command(state.SSHCommand[0], state.SSHCommand[1:]...)
     cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 
@@ -487,21 +443,26 @@ func attemptTunnelRestart(state *ProxyState) bool {
         return false
     }
 
-    // Save PID
     savePid(Config.TempFiles.SSHTunnelPID, cmd.Process.Pid, state.Host)
 
-    // Wait for tunnel to become available (max 10 seconds)
-    for i := 0; i < 10; i++ {
-        time.Sleep(1 * time.Second)
-        if checkProxyConnectivity() {
-            logTunnelEvent("OK", state.Host, "Tunnel restart successful")
-            return true
+    // Wait for tunnel to become available (max 10 seconds) using Ticker
+    const restartTimeout = 10 * time.Second
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
+    timeoutCh := time.After(restartTimeout)
+
+    for {
+        select {
+        case <-timeoutCh:
+            logTunnelEvent("ERROR", state.Host, fmt.Sprintf("Tunnel restart timeout (%v)", restartTimeout))
+            killPid(cmd.Process.Pid)
+            os.Remove(Config.TempFiles.SSHTunnelPID)
+            return false
+        case <-ticker.C:
+            if checkProxyConnectivity() {
+                logTunnelEvent("OK", state.Host, "Tunnel restart successful")
+                return true
+            }
         }
     }
-
-    // Tunnel didn't respond in time
-    logTunnelEvent("ERROR", state.Host, "Tunnel restart timeout (10 seconds)")
-    killPid(cmd.Process.Pid)
-    os.Remove(Config.TempFiles.SSHTunnelPID)
-    return false
 }

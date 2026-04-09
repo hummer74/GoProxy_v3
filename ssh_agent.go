@@ -14,6 +14,7 @@ import (
 
 // ensureSSHAgent checks if ssh-agent is running, starts it if needed, and adds the key
 func ensureSSHAgent(sshKeyPath, sshKeyPass string) bool {
+    debugLog("AGENT", "ensureSSHAgent: key=%s", sshKeyPath)
     if sshKeyPath == "" {
         return true
     }
@@ -47,6 +48,7 @@ func ensureSSHAgent(sshKeyPath, sshKeyPass string) bool {
 
 // checkAndStartSSHAgent checks and starts SSH-Agent service if necessary
 func checkAndStartSSHAgent() bool {
+    debugLog("AGENT", "Checking SSH-Agent service...")
     if _, err := exec.LookPath("ssh-add"); err != nil {
         return false
     }
@@ -75,7 +77,9 @@ func checkAndStartSSHAgent() bool {
     cmdCheck2.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
     output2, _ := cmdCheck2.CombinedOutput()
 
-    return strings.Contains(string(output2), "RUNNING")
+    result := strings.Contains(string(output2), "RUNNING")
+    debugLog("AGENT", "SSH-Agent service check result: running=%v", result)
+    return result
 }
 
 func isKeyInAgent(keyPath string) bool {
@@ -115,6 +119,7 @@ func checkKeyFingerprint(keyPath, agentOutput string) bool {
 }
 
 func addKeyToAgent(keyPath, passphrase string) bool {
+    debugLog("AGENT", "Adding key to agent: %s", filepath.Base(keyPath))
     ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
     defer cancel()
 
@@ -135,7 +140,13 @@ func addKeyToAgent(keyPath, passphrase string) bool {
     outputStr := string(output)
 
     if ctx.Err() == context.DeadlineExceeded {
-        logTunnelEvent("ERROR", "SSH-Agent", "ssh-add timed out (prevented indefinite hang)")
+        // Race condition: context expired but ssh-add may have succeeded.
+        // Verify the key is actually in the agent before reporting failure.
+        if isKeyInAgent(keyPath) {
+            debugLog("AGENT", "ssh-add timed out but key is present in agent — success")
+            return true
+        }
+        logTunnelEvent("ERROR", "SSH-Agent", "ssh-add timed out and key not in agent")
         return false
     }
 
@@ -154,7 +165,10 @@ func addKeyToAgent(keyPath, passphrase string) bool {
 
 // trySSHAdd attempts to add SSH-KEY using ssh-add (legacy support)
 func trySSHAdd(sshKeyPath, sshKeyPass string) bool {
-    cmd := exec.Command("ssh-add", sshKeyPath)
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+
+    cmd := exec.CommandContext(ctx, "ssh-add", sshKeyPath)
 
     if sshKeyPass != "" {
         tempDir := os.TempDir()
@@ -175,6 +189,15 @@ func trySSHAdd(sshKeyPath, sshKeyPass string) bool {
     cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
     output, err := cmd.CombinedOutput()
     outputStr := string(output)
+
+    if ctx.Err() == context.DeadlineExceeded {
+        if isKeyInAgent(sshKeyPath) {
+            debugLog("AGENT", "trySSHAdd timed out but key is present in agent — success")
+            return true
+        }
+        logTunnelEvent("ERROR", "SSH-Agent", "trySSHAdd timed out and key not in agent")
+        return false
+    }
 
     if err == nil {
         return true
@@ -199,6 +222,7 @@ func stopSSHAgent() bool {
 
 // cleanupSSHAgent removes added keys from agent
 func cleanupSSHAgent() {
+    debugLog("AGENT", "Cleaning up SSH agent")
     cmd := exec.Command("ssh-add", "-D")
     cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
     _ = cmd.Run()

@@ -25,7 +25,6 @@ type AppConfig struct {
     General struct {
         AppName              string `ini:"AppName"`
         AutoConnect          bool   `ini:"AutoConnect"`
-        AutoSelectTimeout    int    `ini:"AutoSelectTimeout"`    // Auto-select timeout in seconds
         LogSSHErrors         bool   `ini:"LogSSHErrors"`         // Enable SSH error logging
         LogTunnelEvents      bool   `ini:"LogTunnelEvents"`      // Enable tunnel event logging
         HostsCheckInterval   int    `ini:"HostsCheckInterval"`   // Hosts availability check interval in seconds for tray menu
@@ -75,6 +74,7 @@ type HostConfig struct {
     User         string
     Port         string
     IdentityFile string
+    ProxyJump    string // SSH ProxyJump directive (e.g. "x-JUMPER")
 }
 
 // ProxyState is persisted on disk and used by tray monitor and restarter
@@ -116,12 +116,12 @@ const (
 
 // Unicode characters for tray menu
 const (
-    GreenCircle  = "●" // U+25CF
-    RedCircle    = "○" // U+25CB
-    CurrentArrow = "→" // U+2192
-    CheckMark    = "✓" // U+2713
-    ChainArrow   = "▸" // U+25B8
-    ClearX       = "✕" // U+2715
+    GreenCircle  = "✅" // U+2705 White Heavy Check Mark
+    RedCircle    = "❌" // U+274C Cross Mark
+    CurrentArrow = "▶" // U+25B6 Black Right-Pointing Triangle
+    CheckMark    = "✓" // U+2713 Check Mark
+    ChainArrow   = "▶" // U+25B6 Black Right-Pointing Triangle
+    ClearX       = "⬜" // U+2B1C White Large Square
 )
 
 // Circled number characters for chain position display (1-10)
@@ -158,6 +158,7 @@ func LoadConfig(cfgPath string) error {
         if !isTrayMode {
             fmt.Printf("%s→%s Configuration loaded from: %s\n", ColorCyan, ColorReset, cfgPath)
         }
+        debugLog("CONFIG", "Config loaded from: %s", cfgPath)
     } else {
         // Create default INI file
         if err := SaveConfig(cfgPath); err != nil {
@@ -187,7 +188,6 @@ func SaveConfig(cfgPath string) error {
     sec.NewKey("AutoConnect", strconv.FormatBool(Config.General.AutoConnect))
     sec.NewKey("SmartFailover", strconv.FormatBool(Config.General.SmartFailover))
     sec.NewKey("ReturnToOriginalHost", strconv.FormatBool(Config.General.ReturnToOriginalHost))
-    sec.NewKey("AutoSelectTimeout", strconv.Itoa(Config.General.AutoSelectTimeout))
     sec.NewKey("FailoverResponseTime", strconv.Itoa(Config.General.FailoverResponseTime))
     sec.NewKey("HostsCheckInterval", strconv.Itoa(Config.General.HostsCheckInterval))
     sec.NewKey("OriginalHostCheck", strconv.Itoa(Config.General.OriginalHostCheck))
@@ -228,7 +228,6 @@ func setDefaultConfig() {
     // General settings
     Config.General.AppName = "GoProxy Manager"
     Config.General.AutoConnect = true
-    Config.General.AutoSelectTimeout = 3        // 3 seconds (changed from 5)
     Config.General.LogSSHErrors = false         // Default: disable SSH error logging
     Config.General.LogTunnelEvents = true       // Enable tunnel event logging (changed from false)
     Config.General.HostsCheckInterval = 180     // Check hosts every 3 minutes (180 seconds) (changed from 120)
@@ -337,6 +336,8 @@ func logTunnelEvent(eventType, host, message string) {
             fmt.Printf("%s→%s %s: %s\n", ColorCyan, ColorReset, host, message)
         }
     }
+
+    debugLog("TUNNEL", "[%s] %s: %s", eventType, host, message)
 }
 
 // logSSHError logs SSH connection errors
@@ -361,6 +362,8 @@ func logSSHError(host, errorType, message string) {
     if !isTrayMode {
         fmt.Printf("%s✗%s SSH error %s (%s): %s\n", ColorRed, ColorReset, host, errorType, message)
     }
+
+    debugLog("SSH", "[%s] %s (%s): %s", host, errorType, message)
 }
 
 // Helpers for status output (kept for backward compatibility)

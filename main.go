@@ -1,165 +1,146 @@
+// main.go
 package main
 
 import (
-    "flag"
-    "fmt"
-    "os"
-    "os/exec"
-    "path/filepath"
-    "time"
+        "flag"
+        "fmt"
+        "os"
+        "path/filepath"
+        "time"
 
-    windows "golang.org/x/sys/windows"
+        windows "golang.org/x/sys/windows"
 )
 
 var appMutex windows.Handle // Global mutex handle
 
 // createAppMutex creates named mutex to prevent multiple instances
 func createAppMutex() (windows.Handle, error) {
-    // Create unique mutex name based on executable path
-    execPath, _ := os.Executable()
-    mutexName := fmt.Sprintf("Global\\GoProxyMutex_%x", filepath.Base(execPath))
+        execPath, _ := os.Executable()
+        mutexName := fmt.Sprintf("Global\\GoProxyMutex_%x", filepath.Base(execPath))
 
-    // Try to create mutex
-    mutex, err := windows.CreateMutex(nil, false, windows.StringToUTF16Ptr(mutexName))
-    if err != nil {
-        // If mutex already exists, application is already running
-        return 0, fmt.Errorf("application is already running")
-    }
+        mutex, err := windows.CreateMutex(nil, false, windows.StringToUTF16Ptr(mutexName))
+        if err != nil {
+                return 0, fmt.Errorf("application is already running")
+        }
 
-    appMutex = mutex
-    return mutex, nil
+        appMutex = mutex
+        return mutex, nil
 }
 
 // ReleaseAppMutex releases the global application mutex
 func ReleaseAppMutex() {
-    if appMutex != 0 {
-        windows.CloseHandle(appMutex)
-        appMutex = 0
-    }
+        if appMutex != 0 {
+                windows.CloseHandle(appMutex)
+                appMutex = 0
+        }
 }
 
 func main() {
-    // Create mutex for blocking multiple instances
-    _, err := createAppMutex()
-    if err != nil {
-        fmt.Printf("Error: %v\n", err)
-        fmt.Println("GoProxy is already running in another instance.")
-        fmt.Println("If this is incorrect, please wait a moment and try again.")
-        os.Exit(1)
-    }
-    defer ReleaseAppMutex()
+        // ── Global panic recovery — catches ANY unhandled panic ──
+        defer func() {
+                if r := recover(); r != nil {
+                        writeCrashLog(r)
+                        fmt.Fprintf(os.Stderr, "\n*** GoProxy CRASH ***\n")
+                        fmt.Fprintf(os.Stderr, "Panic: %v\n", r)
+                        fmt.Fprintf(os.Stderr, "Crash log: x_goproxy_crash.log\n")
+                        if debugEnabled {
+                                fmt.Fprintf(os.Stderr, "Debug log: x_goproxy_debug.log\n")
+                        }
+                        fmt.Fprintf(os.Stderr, "Press any key to exit...\n")
+                        time.Sleep(10 * time.Second)
+                        os.Exit(1)
+                }
+        }()
 
-    // Parse command line arguments
-    cliFlag := flag.Bool("cli", false, "Interactive CLI mode")
-    stopFlag := flag.Bool("stop", false, "Stop proxy and cleanup")
-    flag.Parse()
+        // ── Parse command line flags ──
+        logFlag := flag.Bool("log", false, "Enable debug logging (x_goproxy_debug.log)")
+        stopFlag := flag.Bool("stop", false, "Stop proxy and cleanup")
+        flag.Parse()
 
-    // Determine mode: default=tray, -cli=interactive, -stop=stop
-    var mode string
-    if *stopFlag {
-        mode = "stop"
-    } else if *cliFlag {
-        mode = "interactive"
-    } else {
-        mode = "tray"
-    }
+        if *logFlag {
+                debugEnabled = true
+                fmt.Println("=== GoProxy Debug Mode ===")
+                fmt.Println("Logging to x_goproxy_debug.log")
+                fmt.Println("Crash logs to x_goproxy_crash.log")
+                fmt.Println("=========================")
+        }
 
-    // Set mode flag based on command line argument
-    if mode == "tray" {
+        // ── Create mutex for blocking multiple instances ──
+        _, err := createAppMutex()
+        if err != nil {
+                fmt.Printf("Error: %v\n", err)
+                fmt.Println("GoProxy is already running in another instance.")
+                fmt.Println("If this is incorrect, please wait a moment and try again.")
+                time.Sleep(3 * time.Second)
+                os.Exit(1)
+        }
+        defer ReleaseAppMutex()
+
+        // ── Always tray mode ──
         isTrayMode = true
-    }
 
-    // Enable ANSI color support in Windows console (only for interactive mode)
-    if mode == "interactive" {
-        enableVirtualTerminalProcessing()
-    }
+        // ── Load configuration ──
+        execPath, _ := os.Executable()
+        workDir := filepath.Dir(execPath)
+        cfgPath := filepath.Join(workDir, "GoProxy.ini")
 
-    // Initialize configuration
-    execPath, _ := os.Executable()
-    workDir := filepath.Dir(execPath)
-    cfgPath := filepath.Join(workDir, "GoProxy.ini")
+        debugLog("MAIN", "Executable: %s", execPath)
+        debugLog("MAIN", "WorkDir: %s", workDir)
+        debugLog("MAIN", "Config path: %s", cfgPath)
 
-    if err := LoadConfig(cfgPath); err != nil {
-        if !isTrayMode {
-            fmt.Printf("Warning: Could not load config file: %v\n", err)
-            fmt.Println("Using default configuration...")
+        if err := LoadConfig(cfgPath); err != nil {
+                fmt.Printf("Warning: Could not load config file: %v\n", err)
+                fmt.Println("Using default configuration...")
+                debugLog("MAIN", "Config load error: %v", err)
         }
-    }
 
-    // Clean up any stale flag files on start
-    cleanupFlags()
-
-    // Check and start SSH-Agent service on program start (except for stop mode)
-    if mode != "stop" {
-        if !isTrayMode {
-            printInfo("Checking SSH-Agent service...")
+        // ── Initialize debug logging AFTER config is loaded ──
+        if *logFlag {
+                initDebugLogging(Config.Paths.WorkDir)
         }
-        if !checkAndStartSSHAgent() {
-            if !isTrayMode {
-                printWarn("SSH-Agent service check failed. SSH connections may not work properly.")
-                printWarn("You can try to start it manually as Administrator:")
-                printWarn("  sc config ssh-agent start=auto")
-                printWarn("  sc start ssh-agent")
-            }
+
+        debugLog("MAIN", "GoProxy starting (PID %d)", os.Getpid())
+        debugLog("MAIN", "debugEnabled=%v, stopFlag=%v", *logFlag, *stopFlag)
+        debugLog("MAIN", "Config: WorkDir=%s ProxyPort=%d PACPort=%d",
+                Config.Paths.WorkDir, Config.Network.ProxyPort, Config.Network.PACHttpPort)
+
+        // ── Clean up stale flag files ──
+        cleanupFlags()
+
+        // ── Check and start SSH-Agent (except for stop mode) ──
+        if !*stopFlag {
+                debugLog("MAIN", "Checking SSH-Agent service...")
+                if !checkAndStartSSHAgent() {
+                        debugLog("MAIN", "SSH-Agent check failed")
+                } else {
+                        debugLog("MAIN", "SSH-Agent service is running")
+                }
+                defer cleanupSSHAgent()
         }
-        defer cleanupSSHAgent()
-    }
 
-    // Run the selected mode
-    switch mode {
-    case "stop":
-        runStopMode()
-    case "tray":
-        runTrayMode()
-    case "interactive":
-        runInteractiveMode()
-    }
-}
-
-// enableVirtualTerminalProcessing enables ANSI color support in the Windows console
-func enableVirtualTerminalProcessing() {
-    handle := windows.Handle(os.Stdout.Fd())
-    var mode uint32
-    const ENABLE_VIRTUAL_TERMINAL_PROCESSING uint32 = 0x0004
-    if err := windows.GetConsoleMode(handle, &mode); err == nil {
-        _ = windows.SetConsoleMode(handle, mode|ENABLE_VIRTUAL_TERMINAL_PROCESSING)
-    }
+        // ── Run selected mode ──
+        if *stopFlag {
+                debugLog("MAIN", "Mode: STOP")
+                runStopMode()
+        } else {
+                debugLog("MAIN", "Mode: TRAY")
+                runTrayMode()
+        }
 }
 
 // cleanupFlags removes stale flag files from previous sessions
 func cleanupFlags() {
-    files := []string{
-        Config.TempFiles.StopFlag,
-    }
+        files := []string{
+                Config.TempFiles.StopFlag,
+        }
 
-    for _, f := range files {
-        if _, err := os.Stat(f); err == nil {
-            // Check if file is old (more than 1 hour)
-            if info, err := os.Stat(f); err == nil {
-                if time.Since(info.ModTime()) > time.Hour {
-                    os.Remove(f)
+        for _, f := range files {
+                if _, err := os.Stat(f); err == nil {
+                        if info, err := os.Stat(f); err == nil {
+                                if time.Since(info.ModTime()) > time.Hour {
+                                        os.Remove(f)
+                                }
+                        }
                 }
-            }
         }
-    }
-}
-
-// startTrayProcess launches the current executable in tray mode without a console window
-func startTrayProcess(execPath string) {
-    if !isTrayMode {
-        printInfo("Attempting to launch Tray Monitor...")
-    }
-
-    // No flags needed — default mode is tray
-    cmd := exec.Command(execPath)
-    cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-    if err := cmd.Start(); err == nil {
-        if !isTrayMode {
-            printOk(fmt.Sprintf("Tray Monitor started with PID %d. Please check the tray icon.", cmd.Process.Pid))
-        }
-    } else {
-        if !isTrayMode {
-            printErr(fmt.Sprintf("Failed to launch Tray Monitor: %v", err))
-        }
-    }
 }
