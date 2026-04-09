@@ -4,9 +4,64 @@ package main
 import (
         "fmt"
         "os"
+        "os/exec"
         "path/filepath"
+        "regexp"
         "strings"
+        "sync"
+
+        windows "golang.org/x/sys/windows"
 )
+
+// sshVersionInfo caches the detected SSH version (parsed once, used many times)
+var (
+        sshVersionMajor int
+        sshVersionMinor int
+        sshVersionOnce  sync.Once
+        sshVersionReady bool
+)
+
+// getSSHVersion parses the local SSH version via "ssh -V".
+// Returns (major, minor) and caches the result.
+// On failure returns (0, 0) — safest defaults will be used.
+func getSSHVersion() (int, int) {
+        sshVersionOnce.Do(func() {
+                cmd := exec.Command("ssh", "-V")
+                cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+                output, err := cmd.CombinedOutput()
+                if err != nil {
+                        debugLog("SSH-VER", "Failed to get SSH version: %v", err)
+                        return
+                }
+
+                // OpenSSH_for_Windows_8.6p1, LibreSSL 3.4.3
+                // OpenSSH_9.5p1, OpenSSL 3.3.1
+                // ssh: OpenSSH_9.8p1 ...
+                re := regexp.MustCompile(`OpenSSH[_ ](?:for_Windows_)?(\d+)\.(\d+)`)
+                matches := re.FindStringSubmatch(string(output))
+                if len(matches) >= 3 {
+                        fmt.Sscanf(matches[1], "%d", &sshVersionMajor)
+                        fmt.Sscanf(matches[2], "%d", &sshVersionMinor)
+                        sshVersionReady = true
+                        debugLog("SSH-VER", "Detected SSH version: %d.%d", sshVersionMajor, sshVersionMinor)
+                } else {
+                        debugLog("SSH-VER", "Could not parse SSH version from: %q", string(output))
+                }
+        })
+        return sshVersionMajor, sshVersionMinor
+}
+
+// sshVersionAtLeast returns true if the local SSH version is >= (major.minor).
+func sshVersionAtLeast(major, minor int) bool {
+        m, n := getSSHVersion()
+        if !sshVersionReady {
+                return false // Unknown version — use safest defaults
+        }
+        if m != major {
+                return m > major
+        }
+        return n >= minor
+}
 
 // buildSSHCommand constructs the full SSH tunnel command for single host or chain.
 //
@@ -41,9 +96,6 @@ func buildSSHCommand(hosts []HostConfig, keyPath string) []string {
     ExitOnForwardFailure yes
     LogLevel INFO
     RequestTTY no
-    TCPSndBuf 4194304
-    TCPRcvBuf 4194304
-    TCPRcvBufPoll yes
 
 `, filepath.ToSlash(knownHostsPath))
 

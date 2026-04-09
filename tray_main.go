@@ -90,6 +90,10 @@ func onTrayReady() {
     monitoringStopChan = make(chan bool, 1)
     debugLog("TRAY", "Stop channel initialized")
 
+    // Detect SSH version once at startup (for version-dependent config options)
+    major, minor := getSSHVersion()
+    debugLog("TRAY", "SSH version: %d.%d", major, minor)
+
     // Clear any existing menu by reassigning variables
     hostMenuItems = make(map[string]*systray.MenuItem)
     hostStatusCache = NewHostStatusCache()

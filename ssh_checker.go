@@ -14,7 +14,7 @@ import (
 var checkSSHConnectionWithTimeFn = checkSSHConnectionWithTime
 
 // checkSSHConnectionAdvanced проверяет SSH соединение с использованием той же команды, что и для туннеля
-// Возвращает true если SSH команда успешно выполняется за 5 секунд
+// Возвращает true если SSH команда успешно выполняется за FailoverResponseTime секунд
 func checkSSHConnectionAdvanced(host HostConfig, workDir string) bool {
         debugLog("CHECKER", "Checking host: %s (%s:%s)", host.Name, host.HostName, host.Port)
 
@@ -40,7 +40,12 @@ func checkSSHConnectionAdvanced(host HostConfig, workDir string) bool {
                 return false
         }
 
-        // Таймаут 5 секунд для медленных сетей
+        // Таймаут на основе конфигурации
+        sshTimeout := time.Duration(Config.General.FailoverResponseTime) * time.Second
+        if sshTimeout == 0 {
+                sshTimeout = 5 * time.Second
+        }
+
         done := make(chan error, 1)
         go func() {
                 done <- cmd.Wait()
@@ -82,12 +87,12 @@ func checkSSHConnectionAdvanced(host HostConfig, workDir string) bool {
                 // Команда завершилась успешно
                 return true
 
-        case <-time.After(5 * time.Second):
-                // Таймаут 5 секунд для медленных сетей
+        case <-time.After(sshTimeout):
+                // Таймаут превышен
                 if cmd.Process != nil {
                         killPid(cmd.Process.Pid)
                 }
-                logSSHError(host.Name, "TIMEOUT", "5 second timeout exceeded")
+                logSSHError(host.Name, "TIMEOUT", fmt.Sprintf("%v timeout exceeded", sshTimeout))
                 return false
         }
 }
@@ -175,7 +180,7 @@ func buildTestSSHCommand(host HostConfig, workDir string) []string {
         // Опции для проверки - такие же как в реальном подключении, но с более короткими таймаутами
         cmd = append(cmd,
                 "-o", "BatchMode=yes", // Не запрашивать пароль
-                "-o", "ConnectTimeout=5", // Таймаут подключения 5 секунд для медленных сетей
+                "-o", fmt.Sprintf("ConnectTimeout=%d", Config.General.FailoverResponseTime), // Таймаут подключения из конфига
                 "-o", "ServerAliveInterval=5", // Проверка активности
                 "-o", "ServerAliveCountMax=6", // Быстро отключаться если нет ответа
                 "-o", "StrictHostKeyChecking=accept-new",

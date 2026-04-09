@@ -25,7 +25,6 @@ type AppConfig struct {
     General struct {
         AppName              string `ini:"AppName"`
         AutoConnect          bool   `ini:"AutoConnect"`
-        AutoSelectTimeout    int    `ini:"AutoSelectTimeout"`    // Auto-select timeout in seconds
         LogSSHErrors         bool   `ini:"LogSSHErrors"`         // Enable SSH error logging
         LogTunnelEvents      bool   `ini:"LogTunnelEvents"`      // Enable tunnel event logging
         HostsCheckInterval   int    `ini:"HostsCheckInterval"`   // Hosts availability check interval in seconds for tray menu
@@ -189,7 +188,6 @@ func SaveConfig(cfgPath string) error {
     sec.NewKey("AutoConnect", strconv.FormatBool(Config.General.AutoConnect))
     sec.NewKey("SmartFailover", strconv.FormatBool(Config.General.SmartFailover))
     sec.NewKey("ReturnToOriginalHost", strconv.FormatBool(Config.General.ReturnToOriginalHost))
-    sec.NewKey("AutoSelectTimeout", strconv.Itoa(Config.General.AutoSelectTimeout))
     sec.NewKey("FailoverResponseTime", strconv.Itoa(Config.General.FailoverResponseTime))
     sec.NewKey("HostsCheckInterval", strconv.Itoa(Config.General.HostsCheckInterval))
     sec.NewKey("OriginalHostCheck", strconv.Itoa(Config.General.OriginalHostCheck))
@@ -230,7 +228,6 @@ func setDefaultConfig() {
     // General settings
     Config.General.AppName = "GoProxy Manager"
     Config.General.AutoConnect = true
-    Config.General.AutoSelectTimeout = 3        // 3 seconds (changed from 5)
     Config.General.LogSSHErrors = false         // Default: disable SSH error logging
     Config.General.LogTunnelEvents = true       // Enable tunnel event logging (changed from false)
     Config.General.HostsCheckInterval = 180     // Check hosts every 3 minutes (180 seconds) (changed from 120)
