@@ -69,8 +69,10 @@ func establishConnection(opts ConnectOptions) *ProxyState {
                 sshKeyPath = resolveSSHKeyPath(Config.Paths.WorkDir, opts.Hosts[0].IdentityFile)
         }
         sshKeyPass := loadSSHKeyPassphrase()
-        ensureSSHAgent(sshKeyPath, sshKeyPass)
-        debugLog("PIPELINE", "SSH key loaded into agent: %s", sshKeyPath)
+        if !ensureSSHAgent(sshKeyPath, sshKeyPass) {
+                logTunnelEvent("WARN", "SSH-Agent", "Failed to load SSH key into agent")
+        }
+        debugLog("PIPELINE", "SSH key: %s", sshKeyPath)
 
         // ── 3. Build SSH command ────────────────────────────────────────────
         sshCmd := opts.SSHCommand

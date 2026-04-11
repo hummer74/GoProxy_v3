@@ -665,6 +665,12 @@ func statusText(available bool) string {
 
 // ── Menu state ───────────────────────────────────────────────────────────
 
+// lastMenuState tracks the previous state for change detection
+var lastMenuState struct {
+    active bool
+    host   string
+}
+
 // updateMenuState updates the state of menu items based on current tunnel status.
 // Iterates over ALL hostMenuItems (all groups) instead of just the first group.
 func updateMenuState() {
@@ -678,7 +684,14 @@ func updateMenuState() {
 
     // Parse active chain connection
     currentHostVal := connState.GetHost()
-    debugLog("MENU", "updateMenuState: active=%v, host=%q", connState.IsActive(), currentHostVal)
+
+    // Log only when state actually changes
+    isActive := connState.IsActive()
+    if isActive != lastMenuState.active || currentHostVal != lastMenuState.host {
+        debugLog("MENU", "updateMenuState: active=%v, host=%q", isActive, currentHostVal)
+        lastMenuState.active = isActive
+        lastMenuState.host = currentHostVal
+    }
 
     isChain := false
     var chainParts []string
