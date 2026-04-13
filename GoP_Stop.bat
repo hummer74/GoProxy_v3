@@ -15,5 +15,6 @@ ssh-add -d
 timeout /t 1 /nobreak >nul
 taskkill /F /IM ssh-agent.exe /IM ssh-add.exe
 timeout /t 1 /nobreak >nul
+del "%~dp0.ssh\goproxy_known_hosts" /q
 echo EXIT.
 exit 0
