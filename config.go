@@ -363,7 +363,7 @@ func logSSHError(host, errorType, message string) {
         fmt.Printf("%s✗%s SSH error %s (%s): %s\n", ColorRed, ColorReset, host, errorType, message)
     }
 
-    debugLog("SSH", "[%s] %s (%s): %s", host, errorType, message)
+    debugLog("SSH", "[%s] %s (%s)", host, errorType, message)
 }
 
 // Helpers for status output (kept for backward compatibility)

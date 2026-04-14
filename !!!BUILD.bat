@@ -9,8 +9,14 @@ if %ERRORLEVEL% NEQ 0 (
     pause
     exit /b %ERRORLEVEL%
 )
-timeout /t 5 /nobreak >nul
-exit 0
+
+:: Ожидание 10 секунд. При нажатии любой клавиши выходим с кодом 0, иначе продолжаем UPX
+echo Building complete. Exit (Y) or packing (N) ?
+choice /t 10 /c yn /d n > nul
+if errorlevel 2 goto :run_upx
+exit /b 0
+
+:run_upx
 upx --ultra-brute GoProxy.exe
-timeout /t 1 /nobreak >nul
+timeout /t 1 /nobreak > nul
 exit 0
