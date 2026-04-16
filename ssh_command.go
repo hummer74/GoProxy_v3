@@ -90,8 +90,8 @@ func buildSSHCommand(hosts []HostConfig, keyPath string) []string {
     TCPKeepAlive no
     ControlPersist 1m
     ServerAliveInterval 5
-    ServerAliveCountMax 6
-    StrictHostKeyChecking accept-new
+    ServerAliveCountMax 2
+    StrictHostKeyChecking no
     UserKnownHostsFile "%s"
     ExitOnForwardFailure yes
     LogLevel INFO
