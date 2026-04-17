@@ -182,8 +182,8 @@ func buildTestSSHCommand(host HostConfig, workDir string) []string {
                 "-o", "BatchMode=yes", // Не запрашивать пароль
                 "-o", fmt.Sprintf("ConnectTimeout=%d", Config.General.FailoverResponseTime), // Таймаут подключения из конфига
                 "-o", "ServerAliveInterval=5", // Проверка активности
-                "-o", "ServerAliveCountMax=6", // Быстро отключаться если нет ответа
-                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ServerAliveCountMax=2", // Быстро отключаться если нет ответа
+                "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=nul",
                 "-o", "TCPKeepAlive=no",
                 "-o", "LogLevel=ERROR", // Только ошибки
