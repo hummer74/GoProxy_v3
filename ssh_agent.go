@@ -229,28 +229,66 @@ func cleanupSSHAgent() {
     _ = stopSSHAgent()
 }
 
-// testSSHKeyDirectly tests if SSH-KEY works by trying a simple SSH command
-func testSSHKeyDirectly(sshKeyPath, sshKeyPass string) bool {
-    // Try to list keys in agent first
-    cmdList := exec.Command("ssh-add", "-l")
+// testSSHKeyDirectly tests if SSH-KEY works by trying a simple SSH command.
+// It first checks if the key is loaded in ssh-agent, then attempts a connection test.
+// Returns true if the key is valid and functional, false otherwise.
+func testSSHKeyDirectly(sshKeyPath string) bool {
+    debugLog("AGENT", "Testing SSH key directly: %s", filepath.Base(sshKeyPath))
+
+    // Step 1: Check if any keys are loaded in ssh-agent
+    ctxList, cancelList := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancelList()
+    cmdList := exec.CommandContext(ctxList, "ssh-add", "-l")
     cmdList.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-    if output, err := cmdList.CombinedOutput(); err == nil && len(output) > 0 {
-        return true
+    output, err := cmdList.CombinedOutput()
+    if err == nil && len(output) > 0 {
+        // Verify the specific key is in agent by comparing fingerprints
+        if isKeyInAgent(sshKeyPath) {
+            debugLog("AGENT", "SSH key found in agent")
+            return true
+        }
+        debugLog("AGENT", "SSH key not found in agent")
     }
 
-    // If no keys in agent, try to use SSH-KEY directly with SSH.
-    // A connection error means key is accepted.
-    testCmd := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=1",
-        "-i", sshKeyPath, "localhost", "echo test")
+    // Step 2: Attempt direct SSH connection test using the key.
+    // BatchMode=yes prevents passphrase prompts, ConnectTimeout limits wait time.
+    // A network/connection error means the key was accepted (auth failed but key valid).
+    // Only auth-related errors indicate key is invalid.
+    ctxTest, cancelTest := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancelTest()
+    testCmd := exec.CommandContext(ctxTest, "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=1",
+        "-o", "StrictHostKeyChecking=no", // Avoid host key verification issues during test
+        "-i", sshKeyPath,
+        "localhost", "echo test")
     testCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 
-    _, err := testCmd.CombinedOutput()
+    _, err = testCmd.CombinedOutput()
     if err != nil {
-        if strings.Contains(err.Error(), "Permission denied") || strings.Contains(err.Error(), "private key") {
+        // Check for auth-related errors that indicate key is invalid
+        exitErr, ok := err.(*exec.ExitError)
+        if !ok {
+            // Non-standard error (e.g., context timeout) — treat as failure
+            debugLog("AGENT", "SSH test failed with unexpected error: %v", err)
             return false
         }
+
+        exitMsg := string(exitErr.Stderr)
+        // Permission denied or key-related errors mean the key is invalid
+        if strings.Contains(exitMsg, "Permission denied") ||
+            strings.Contains(exitMsg, "private key") ||
+            strings.Contains(exitMsg, "Authentication failed") {
+            debugLog("AGENT", "SSH test failed: auth error indicates invalid key")
+            return false
+        }
+
+        // Connection/network errors mean key was accepted but connection failed — key is valid
+        debugLog("AGENT", "SSH test: key accepted (connection error is expected)")
         return true
     }
 
+    // SSH command succeeded — key works perfectly
+    debugLog("AGENT", "SSH test: key works successfully")
     return true
 }
