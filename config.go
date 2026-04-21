@@ -229,13 +229,13 @@ func setDefaultConfig() {
 	// General settings
 	Config.General.AppName = "GoProxy Manager"
 	Config.General.AutoConnect = true
-	Config.General.LogSSHErrors = false         // Default: disable SSH error logging
-	Config.General.LogTunnelEvents = true       // Enable tunnel event logging (changed from false)
-	Config.General.HostsCheckInterval = 180     // Check hosts every 3 minutes (180 seconds) (changed from 120)
-	Config.General.SmartFailover = false        // Disable smart failover (changed from true)
-	Config.General.ReturnToOriginalHost = false // Disable return to original host (changed from true)
-	Config.General.OriginalHostCheck = 30       // Check original host every 30 seconds (changed from 300)
-	Config.General.FailoverResponseTime = 5     // Max response time 5 seconds (unchanged)
+	Config.General.LogSSHErrors = false        // Default: disable SSH error logging
+	Config.General.LogTunnelEvents = true      // Enable tunnel event logging (changed from false)
+	Config.General.HostsCheckInterval = 180    // Check hosts every 3 minutes (180 seconds) (changed from 120)
+	Config.General.SmartFailover = true        // Enable smart failover (changed from false)
+	Config.General.ReturnToOriginalHost = true // Enable return to original host (changed from false)
+	Config.General.OriginalHostCheck = 30      // Check original host every 30 seconds (changed from 300)
+	Config.General.FailoverResponseTime = 5    // Max response time 5 seconds (unchanged)
 
 	// Network settings
 	Config.Network.ProxyPort = 1080

@@ -40,15 +40,15 @@ type monitoringConfig struct {
 	origHostCheckInterval time.Duration
 
 	// Mutable session state
-	isReconnecting        bool
-	isFatalError          bool
-	reconnectStartTime    time.Time
-	lastInternetCheck     time.Time
-	lastReconnectAttempt  time.Time
-	lastSocksCheck        time.Time
-	lastOrigHostCheck     time.Time
-	networkAvailable      bool
-	reconnectAttempts     int
+	isReconnecting       bool
+	isFatalError         bool
+	reconnectStartTime   time.Time
+	lastInternetCheck    time.Time
+	lastReconnectAttempt time.Time
+	lastSocksCheck       time.Time
+	lastOrigHostCheck    time.Time
+	networkAvailable     bool
+	reconnectAttempts    int
 }
 
 func newMonitoringConfig() *monitoringConfig {
@@ -442,16 +442,22 @@ func tryAutoConnectLastHost() {
 		}
 
 		if len(chain) > 0 {
+			// Check if first host in chain is available
+			available, _ := checkSSHConnectionWithTime(chain[0], Config.Paths.WorkDir)
+			if !available {
+				debugLog("MONITOR", "First host in chain %s unavailable, skipping auto-connect", chain[0].Name)
+				return
+			}
 			safeGo(func() {
 				time.Sleep(2 * time.Second)
 				chainDisplay := strings.Join(chainNames, " -> ")
 				establishConnection(ConnectOptions{
 					Hosts:              chain,
 					IsChain:            true,
-					OriginalHost:       chainDisplay,
+					OriginalHost:       lastHost,
 					KillExistingTunnel: true,
 					EnableSystemProxy:  true,
-					SaveLastHost:       true,
+					SaveLastHost:       false,
 					StartMonitoring:    true,
 					UpdateTray:         true,
 					DisplayAlias:       "Chain",
@@ -469,9 +475,36 @@ func tryAutoConnectLastHost() {
 			if host.Name == lastHost {
 				firstGroup := hosts[0].Group
 				if host.Group == firstGroup {
+					available, _ := checkSSHConnectionWithTime(host, Config.Paths.WorkDir)
+					if !available {
+						debugLog("MONITOR", "Last host %s unavailable, looking for fallback", lastHost)
+						// Найти альтернативный хост
+						var availableHosts []HostConfig
+						for _, h := range hosts {
+							if h.Group == firstGroup && h.Name != lastHost && h.ProxyJump == "" {
+								availableHosts = append(availableHosts, h)
+							}
+						}
+						fastestHost, _ := findFastestAvailableHost(availableHosts, Config.Paths.WorkDir)
+						if fastestHost != nil {
+							debugLog("MONITOR", "Fallback: switching to %s", fastestHost.Name)
+							host = *fastestHost
+						} else {
+							debugLog("MONITOR", "No available hosts for fallback")
+							return
+						}
+					}
 					safeGo(func() {
 						time.Sleep(2 * time.Second)
-						handleHostClick(host)
+						establishConnection(ConnectOptions{
+							Hosts:              []HostConfig{host},
+							OriginalHost:       lastHost,
+							KillExistingTunnel: true,
+							EnableSystemProxy:  true,
+							SaveLastHost:       false,
+							StartMonitoring:    true,
+							UpdateTray:         true,
+						})
 					})
 				}
 				break
