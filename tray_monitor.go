@@ -47,6 +47,7 @@ type monitoringConfig struct {
 	lastReconnectAttempt time.Time
 	lastSocksCheck       time.Time
 	lastOrigHostCheck    time.Time
+	lastPriorityCheck    time.Time
 	networkAvailable     bool
 	reconnectAttempts    int
 }
@@ -143,6 +144,43 @@ func (mc *monitoringConfig) handleNormalState(state *ProxyState) bool {
 			logTunnelEvent("OK", state.Host, "Tunnel reconnected successfully")
 			updateMenuState()
 		}
+
+		// Check priority host availability periodically
+		if hasPriorityHost && connState.GetHost() != priorityHost && time.Since(mc.lastPriorityCheck) >= mc.origHostCheckInterval {
+			mc.lastPriorityCheck = time.Now()
+			// Check if priority host is available
+			hosts := parseSSHConfig(Config.Paths.SSHConfig)
+			var priorityHostConfig *HostConfig
+			for _, h := range hosts {
+				if h.Name == priorityHost {
+					priorityHostConfig = &h
+					break
+				}
+			}
+			if priorityHostConfig != nil {
+				available, responseTime := checkSSHConnectionWithTime(*priorityHostConfig, Config.Paths.WorkDir)
+				if available {
+					logTunnelEvent("INFO", connState.GetHost(), fmt.Sprintf("Priority host %s is available (%.2fs), switching back", priorityHost, responseTime.Seconds()))
+					result := establishConnection(ConnectOptions{
+						Hosts:              []HostConfig{*priorityHostConfig},
+						OriginalHost:       priorityHost,
+						StopMonitoring:     true,
+						KillExistingTunnel: true,
+						EnableSystemProxy:  true,
+						SaveLastHost:       false,
+						StartMonitoring:    true,
+						UpdateTray:         true,
+					})
+					if result == nil {
+						logTunnelEvent("ERROR", priorityHost, "Failed to switch to priority host")
+					} else {
+						logTunnelEvent("OK", priorityHost, "Switched to priority host")
+						return true // exit monitoring, new session started
+					}
+				}
+			}
+		}
+
 		return false
 	}
 
@@ -410,22 +448,22 @@ func checkAndRestoreExistingTunnel() {
 // tryAutoConnectLastHost
 // ---------------------------------------------------------------------------
 
-// tryAutoConnectLastHost attempts to auto-connect to the last used host.
+// tryAutoConnectLastHost attempts to auto-connect to the priority host from x_lasthost.cfg
 func tryAutoConnectLastHost() {
 	if !Config.General.AutoConnect {
 		return
 	}
 
-	lastHost := LoadLastHost()
-	if lastHost == "" {
+	priorityHostName := LoadPriorityHost()
+	if priorityHostName == "" {
 		return
 	}
 
-	debugLog("MONITOR", "Auto-connect: lastHost=%s", lastHost)
+	debugLog("MONITOR", "Auto-connect: priorityHost=%s", priorityHostName)
 
-	// Check if lastHost is a chain (contains "|")
-	if strings.Contains(lastHost, "|") {
-		chainNames := strings.Split(lastHost, "|")
+	// Check if priorityHost is a chain (contains "|")
+	if strings.Contains(priorityHostName, "|") {
+		chainNames := strings.Split(priorityHostName, "|")
 		hosts := parseSSHConfig(Config.Paths.SSHConfig)
 		if len(hosts) == 0 {
 			return
@@ -445,60 +483,25 @@ func tryAutoConnectLastHost() {
 			// Check if first host in chain is available
 			available, _ := checkSSHConnectionWithTime(chain[0], Config.Paths.WorkDir)
 			if !available {
-				debugLog("MONITOR", "First host in chain %s unavailable, skipping auto-connect", chain[0].Name)
-				return
-			}
-			safeGo(func() {
-				time.Sleep(2 * time.Second)
-				chainDisplay := strings.Join(chainNames, " -> ")
-				establishConnection(ConnectOptions{
-					Hosts:              chain,
-					IsChain:            true,
-					OriginalHost:       lastHost,
-					KillExistingTunnel: true,
-					EnableSystemProxy:  true,
-					SaveLastHost:       false,
-					StartMonitoring:    true,
-					UpdateTray:         true,
-					DisplayAlias:       "Chain",
-					DisplayTooltip:     chainDisplay,
-				})
-			})
-		}
-	} else {
-		hosts := parseSSHConfig(Config.Paths.SSHConfig)
-		if len(hosts) == 0 {
-			return
-		}
-
-		for _, host := range hosts {
-			if host.Name == lastHost {
-				firstGroup := hosts[0].Group
-				if host.Group == firstGroup {
-					available, _ := checkSSHConnectionWithTime(host, Config.Paths.WorkDir)
-					if !available {
-						debugLog("MONITOR", "Last host %s unavailable, looking for fallback", lastHost)
-						// Найти альтернативный хост
-						var availableHosts []HostConfig
-						for _, h := range hosts {
-							if h.Group == firstGroup && h.Name != lastHost && h.ProxyJump == "" {
-								availableHosts = append(availableHosts, h)
-							}
-						}
-						fastestHost, _ := findFastestAvailableHost(availableHosts, Config.Paths.WorkDir)
-						if fastestHost != nil {
-							debugLog("MONITOR", "Fallback: switching to %s", fastestHost.Name)
-							host = *fastestHost
-						} else {
-							debugLog("MONITOR", "No available hosts for fallback")
-							return
-						}
+				debugLog("MONITOR", "Priority chain first host %s unavailable, looking for fallback", chain[0].Name)
+				// Find fastest available host
+				var availableHosts []HostConfig
+				for _, h := range hosts {
+					if h.Group == hosts[0].Group && !strings.Contains(h.Name, "Rev-") && h.ProxyJump == "" {
+						availableHosts = append(availableHosts, h)
 					}
+				}
+				fastestHost, _ := findFastestAvailableHost(availableHosts, Config.Paths.WorkDir)
+				if fastestHost != nil {
+					debugLog("MONITOR", "Fallback: switching to %s", fastestHost.Name)
+					// Connect to fastest host, but keep priority as original
 					safeGo(func() {
 						time.Sleep(2 * time.Second)
 						establishConnection(ConnectOptions{
-							Hosts:              []HostConfig{host},
-							OriginalHost:       lastHost,
+							Hosts:              []HostConfig{*fastestHost},
+							OriginalHost:       priorityHostName,
+							IsFailoverActive:   true,
+							FailoverStart:      time.Now().Format(time.RFC3339),
 							KillExistingTunnel: true,
 							EnableSystemProxy:  true,
 							SaveLastHost:       false,
@@ -506,9 +509,90 @@ func tryAutoConnectLastHost() {
 							UpdateTray:         true,
 						})
 					})
+				} else {
+					debugLog("MONITOR", "No available hosts for fallback")
 				}
+			} else {
+				// Priority chain available, connect to it
+				safeGo(func() {
+					time.Sleep(2 * time.Second)
+					chainDisplay := strings.Join(chainNames, " -> ")
+					establishConnection(ConnectOptions{
+						Hosts:              chain,
+						IsChain:            true,
+						OriginalHost:       priorityHostName,
+						KillExistingTunnel: true,
+						EnableSystemProxy:  true,
+						SaveLastHost:       false,
+						StartMonitoring:    true,
+						UpdateTray:         true,
+						DisplayAlias:       "Chain",
+						DisplayTooltip:     chainDisplay,
+					})
+				})
+			}
+		}
+	} else {
+		hosts := parseSSHConfig(Config.Paths.SSHConfig)
+		if len(hosts) == 0 {
+			return
+		}
+
+		var priorityHostConfig *HostConfig
+		for _, host := range hosts {
+			if host.Name == priorityHostName {
+				priorityHostConfig = &host
 				break
 			}
+		}
+		if priorityHostConfig == nil {
+			return
+		}
+
+		available, _ := checkSSHConnectionWithTime(*priorityHostConfig, Config.Paths.WorkDir)
+		if !available {
+			debugLog("MONITOR", "Priority host %s unavailable, looking for fallback", priorityHostName)
+			// Find fastest available host
+			var availableHosts []HostConfig
+			for _, h := range hosts {
+				if h.Group == hosts[0].Group && h.Name != priorityHostName && !strings.Contains(h.Name, "Rev-") && h.ProxyJump == "" {
+					availableHosts = append(availableHosts, h)
+				}
+			}
+			fastestHost, _ := findFastestAvailableHost(availableHosts, Config.Paths.WorkDir)
+			if fastestHost != nil {
+				debugLog("MONITOR", "Fallback: switching to %s", fastestHost.Name)
+				safeGo(func() {
+					time.Sleep(2 * time.Second)
+					establishConnection(ConnectOptions{
+						Hosts:              []HostConfig{*fastestHost},
+						OriginalHost:       priorityHostName,
+						IsFailoverActive:   true,
+						FailoverStart:      time.Now().Format(time.RFC3339),
+						KillExistingTunnel: true,
+						EnableSystemProxy:  true,
+						SaveLastHost:       false,
+						StartMonitoring:    true,
+						UpdateTray:         true,
+					})
+				})
+			} else {
+				debugLog("MONITOR", "No available hosts for fallback")
+			}
+		} else {
+			// Priority host available, connect to it
+			safeGo(func() {
+				time.Sleep(2 * time.Second)
+				establishConnection(ConnectOptions{
+					Hosts:              []HostConfig{*priorityHostConfig},
+					OriginalHost:       priorityHostName,
+					KillExistingTunnel: true,
+					EnableSystemProxy:  true,
+					SaveLastHost:       false,
+					StartMonitoring:    true,
+					UpdateTray:         true,
+				})
+			})
 		}
 	}
 }
