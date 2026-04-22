@@ -118,6 +118,14 @@ func main() {
                 defer cleanupSSHAgent()
         }
 
+        // ── Load priority host from x_lasthost.cfg (if available) ──
+        debugLog("MAIN", "Loading priority host from x_lasthost.cfg...")
+        if loadedHost := LoadPriorityHost(); loadedHost != "" {
+        	debugLog("MAIN", "Priority host loaded: %s", loadedHost)
+        } else {
+        	debugLog("MAIN", "No priority host found in x_lasthost.cfg")
+        }
+       
         // ── Run selected mode ──
         if *stopFlag {
                 debugLog("MAIN", "Mode: STOP")

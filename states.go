@@ -49,11 +49,47 @@ func SaveLastHost(hostName string) error {
 
 // LoadLastHost loads the last connected host
 func LoadLastHost() string {
-        if content, err := os.ReadFile(Config.Paths.LastHostFile); err == nil {
-                debugLog("STATE", "Loaded last host: %s", string(content))
-                return string(content)
-        }
-        return ""
+	if content, err := os.ReadFile(Config.Paths.LastHostFile); err == nil {
+		debugLog("STATE", "Loaded last host: %s", string(content))
+		return string(content)
+	}
+	return ""
+}
+
+// PriorityHost file path - .ssh/x_lasthost.cfg (used for priority host selection)
+const PriorityHostFilePath = ".ssh/x_lasthost.cfg"
+
+// LoadPriorityHost loads the priority host from x_lasthost.cfg
+func LoadPriorityHost() string {
+	workDir := Config.Paths.WorkDir
+	if workDir == "" {
+		return ""
+	}
+	
+	priorityPath := filepath.Join(workDir, PriorityHostFilePath)
+	content, err := os.ReadFile(priorityPath)
+	if err != nil {
+		debugLog("STATE", "No priority host file found: %s", priorityPath)
+		return ""
+	}
+	
+	hostName := strings.TrimSpace(string(content))
+	if hostName == "" {
+		debugLog("STATE", "Priority host file is empty")
+		return ""
+	}
+	
+	priorityHost = hostName
+	hasPriorityHost = true
+	debugLog("STATE", "Loaded priority host from x_lasthost.cfg: %s", hostName)
+	return hostName
+}
+
+// ClearPriorityHost clears the current priority host
+func ClearPriorityHost() {
+	priorityHost = ""
+	hasPriorityHost = false
+	debugLog("STATE", "Cleared priority host")
 }
 
 // runStopMode stops the proxy, kills all processes, cleans up files and disables system proxy

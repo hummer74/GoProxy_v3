@@ -16,8 +16,20 @@ var Config *AppConfig
 
 // Global variables for logging mode
 var (
-	isTrayMode bool // Running in tray mode
+	isTrayMode     bool // Running in tray mode
+	priorityHost   string // Priority host from x_lasthost.cfg
+	hasPriorityHost bool  // Whether priority host was loaded
 )
+
+// GetPriorityHost returns the current priority host name
+func GetPriorityHost() string {
+	return priorityHost
+}
+
+// HasPriorityHost returns true if a priority host has been loaded
+func HasPriorityHost() bool {
+	return hasPriorityHost
+}
 
 // AppConfig represents the application configuration structure
 type AppConfig struct {
