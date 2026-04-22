@@ -15,3 +15,4 @@ x_*.*
 .ssh/geoip_ru.txt
 .ssh/proxy_pac.txt
 GoProxy.exe~
+!!!!RULES.txt
