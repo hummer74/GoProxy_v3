@@ -165,6 +165,11 @@ func checkChainHostsReachable(chainHostNames []string) (bool, []string) {
 // attemptChainRecovery tries to re-establish the original chain connection.
 // Called from Recovery state when all original chain hosts are verified reachable.
 // Does NOT start new monitoring — the caller continues managing the state.
+//
+// IMPORTANT: This function now performs a pre-flight tunnel test on a temporary
+// port BEFORE killing the active (failover) tunnel. If the test fails, the
+// failover tunnel stays alive and the function returns false — the caller will
+// retry on the next monitoring cycle.
 func attemptChainRecovery(originalState *ProxyState) bool {
         if originalState == nil {
                 return false
@@ -209,6 +214,39 @@ func attemptChainRecovery(originalState *ProxyState) bool {
 
         logTunnelEvent("INFO", chainDisplay, "Attempting to restore original chain")
 
+        // ── Pre-flight: test tunnel on temporary port BEFORE killing failover ──
+        sshKeyPath := resolveSSHKeyPath(Config.Paths.WorkDir, chain[0].IdentityFile)
+        sshKeyPass := loadSSHKeyPassphrase()
+        if !ensureSSHAgent(sshKeyPath, sshKeyPass) {
+                logTunnelEvent("ERROR", chainDisplay, "Chain recovery: SSH-Agent failed — aborting")
+                return false
+        }
+
+        testSSHCmd := buildSSHCommand(chain, sshKeyPath)
+        testPort := Config.Network.ProxyPort + 1001 // separate from failover test port
+
+        logTunnelEvent("INFO", chainDisplay,
+                fmt.Sprintf("Pre-flight chain test on port %d (failover tunnel stays alive)...", testPort))
+
+        // Use longer timeout for chains (base 15s × chain length, up to 45s)
+        chainTestTimeout := 15 * time.Duration(len(chain)) * time.Second
+        if chainTestTimeout > 45*time.Second {
+                chainTestTimeout = 45 * time.Second
+        }
+        if chainTestTimeout < 15*time.Second {
+                chainTestTimeout = 15 * time.Second
+        }
+
+        if !testTunnelConnectivity(testSSHCmd, testPort, chainTestTimeout) {
+                logTunnelEvent("WARN", chainDisplay,
+                        "Pre-flight chain test FAILED — failover tunnel preserved, will retry later")
+                return false
+        }
+
+        logTunnelEvent("INFO", chainDisplay,
+                "Pre-flight chain test PASSED — switching from failover to original chain")
+
+        // ── Safe to switch now: kill failover tunnel and start original chain ──
         // Connect WITHOUT starting new monitoring and WITHOUT stopping current monitoring
         result := establishConnection(ConnectOptions{
                 Hosts:              chain,
@@ -229,7 +267,7 @@ func attemptChainRecovery(originalState *ProxyState) bool {
                 return true
         }
 
-        logTunnelEvent("WARN", chainDisplay, "Failed to restore original chain, staying in Recovery")
+        logTunnelEvent("WARN", chainDisplay, "Failed to restore original chain after pre-flight passed, staying in Recovery")
         return false
 }
 
@@ -401,7 +439,42 @@ func (mc *monitoringConfig) handleFailoverState(state *ProxyState) bool {
 
         updateTrayStatusReconnecting(fastestHost.Name, fastestHost.HostName)
 
-        // ── 3. Connect to failover host (DON'T stop/start monitoring) ──
+        // ── 3. Pre-flight tunnel test on a temporary port ──
+        // Verify that a full SOCKS5 tunnel can actually be established BEFORE
+        // killing the existing (zombie) tunnel process.
+        sshKeyPath := resolveSSHKeyPath(Config.Paths.WorkDir, fastestHost.IdentityFile)
+        sshKeyPass := loadSSHKeyPassphrase()
+        if !ensureSSHAgent(sshKeyPath, sshKeyPass) {
+                logTunnelEvent("ERROR", fastestHost.Name, "SSH-Agent failed — skipping host")
+                mc.failoverAttempts++
+                if mc.failoverAttempts >= 5 {
+                        mc.enterErrorHalt(state, "Exhausted failover attempts (5)")
+                        return false
+                }
+                return false
+        }
+
+        testSSHCmd := buildSSHCommand([]HostConfig{*fastestHost}, sshKeyPath)
+        testPort := Config.Network.ProxyPort + 1000 // use a port far from the production one
+
+        logTunnelEvent("INFO", fastestHost.Name,
+                fmt.Sprintf("Pre-flight tunnel test on port %d...", testPort))
+
+        if !testTunnelConnectivity(testSSHCmd, testPort, 20*time.Second) {
+                logTunnelEvent("WARN", fastestHost.Name,
+                        "Pre-flight tunnel test FAILED — skipping, will try next host")
+                mc.failoverAttempts++
+                if mc.failoverAttempts >= 5 {
+                        mc.enterErrorHalt(state, "Exhausted failover attempts (5)")
+                        return false
+                }
+                return false
+        }
+
+        logTunnelEvent("INFO", fastestHost.Name,
+                "Pre-flight test PASSED — safe to switch")
+
+        // ── 4. Connect to failover host (DON'T stop/start monitoring) ──
         originalHost := state.Host
         if mc.originalChainState != nil {
                 originalHost = mc.originalChainState.OriginalHost
@@ -530,7 +603,30 @@ func (mc *monitoringConfig) handleRecoveryState(state *ProxyState) bool {
                         logTunnelEvent("INFO", state.Host,
                                 fmt.Sprintf("Original host %s is available (%.2fs), restoring...", origName, responseTime.Seconds()))
 
-                        // Connect to original host WITHOUT stopping/starting monitoring
+                        // ── Pre-flight: test tunnel on temporary port BEFORE killing failover ──
+                        origSSHKeyPath := resolveSSHKeyPath(Config.Paths.WorkDir, origConfig.IdentityFile)
+                        origSSHKeyPass := loadSSHKeyPassphrase()
+                        if !ensureSSHAgent(origSSHKeyPath, origSSHKeyPass) {
+                                logTunnelEvent("ERROR", origName, "Recovery: SSH-Agent failed — aborting restore")
+                                return false
+                        }
+
+                        testSSHCmd := buildSSHCommand([]HostConfig{*origConfig}, origSSHKeyPath)
+                        testPort := Config.Network.ProxyPort + 1002 // separate from other test ports
+
+                        logTunnelEvent("INFO", origName,
+                                fmt.Sprintf("Pre-flight restore test on port %d (failover tunnel stays alive)...", testPort))
+
+                        if !testTunnelConnectivity(testSSHCmd, testPort, 20*time.Second) {
+                                logTunnelEvent("WARN", origName,
+                                        "Pre-flight restore test FAILED — failover tunnel preserved, will retry later")
+                                return false
+                        }
+
+                        logTunnelEvent("INFO", origName,
+                                "Pre-flight restore test PASSED — switching from failover to original")
+
+                        // Safe to switch now: kill failover tunnel and restore original
                         result := establishConnection(ConnectOptions{
                                 Hosts:              []HostConfig{*origConfig},
                                 OriginalHost:       origName,
@@ -554,7 +650,7 @@ func (mc *monitoringConfig) handleRecoveryState(state *ProxyState) bool {
                                 logTunnelEvent("OK", origName, "Returned to original host — Normal state")
                                 updateMenuState()
                         } else {
-                                logTunnelEvent("WARN", origName, "Failed to return to original host, staying in Recovery")
+                                logTunnelEvent("WARN", origName, "Failed to return to original host after pre-flight passed, staying in Recovery")
                         }
                 } else {
                         debugLog("MONITOR", "Recovery: original host %s still unavailable", origName)

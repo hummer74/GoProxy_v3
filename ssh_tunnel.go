@@ -12,6 +12,98 @@ import (
         windows "golang.org/x/sys/windows"
 )
 
+// testTunnelConnectivity starts a temporary SSH tunnel on testPort (NOT the
+// production port) to verify that a full SOCKS5 tunnel can be established.
+// It NEVER touches the main PID file or the running production tunnel.
+//
+// Flow:
+//  1. Clone the SSH command with a different -D port (testPort).
+//  2. Start the SSH process in the background.
+//  3. Poll checkProxyConnectivityOnPort(testPort) every 500 ms.
+//  4. On SOCKS5 success  → kill test process, return true.
+//  5. On timeout / error → kill test process, return false.
+//
+// The caller should call this BEFORE establishConnection to guarantee that
+// killing the old production tunnel is safe.
+func testTunnelConnectivity(sshCmd []string, testPort int, timeout time.Duration) bool {
+        testCmd := replaceSSHTunnelPort(sshCmd, testPort)
+        host := extractHostFromSSHCommand(testCmd)
+
+        debugLog("TUNNEL", "TEST start: host=%s testPort=%d timeout=%v", host, testPort, timeout)
+
+        cmd := exec.Command(testCmd[0], testCmd[1:]...)
+        cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+
+        var stderr bytes.Buffer
+        cmd.Stderr = &stderr
+
+        if err := cmd.Start(); err != nil {
+                debugLog("TUNNEL", "TEST: failed to start SSH process: %v", err)
+                return false
+        }
+
+        testPid := cmd.Process.Pid
+        // Always clean up the test process.
+        defer func() {
+                if cmd.Process != nil {
+                        killPid(testPid)
+                        debugLog("TUNNEL", "TEST: cleaned up PID %d", testPid)
+                }
+        }()
+
+        // Wait goroutine — detects early process exit.
+        done := make(chan error, 1)
+        go func() {
+                defer func() {
+                        if r := recover(); r != nil {
+                                done <- fmt.Errorf("panic: %v", r)
+                        }
+                }()
+                done <- cmd.Wait()
+        }()
+
+        ticker := time.NewTicker(500 * time.Millisecond)
+        defer ticker.Stop()
+        timeoutCh := time.After(timeout)
+
+        for {
+                select {
+                case err := <-done:
+                        stderrStr := stderr.String()
+                        debugLog("TUNNEL", "TEST: process exited (err=%v, stderr=%q)", err, stderrStr)
+                        return false
+
+                case <-timeoutCh:
+                        stderrStr := stderr.String()
+                        if stderrStr != "" {
+                                debugLog("TUNNEL", "TEST: timeout after %v, stderr=%q", timeout, stderrStr)
+                        } else {
+                                debugLog("TUNNEL", "TEST: timeout after %v (no stderr)", timeout)
+                        }
+                        return false
+
+                case <-ticker.C:
+                        if checkProxyConnectivityOnPort(testPort) {
+                                debugLog("TUNNEL", "TEST: SOCKS5 confirmed on port %d — host %s is viable", testPort, host)
+                                return true
+                        }
+
+                        // Detect terminal errors early.
+                        stderrStr := stderr.String()
+                        if stderrStr != "" {
+                                low := strings.ToLower(stderrStr)
+                                if strings.Contains(low, "permission denied") ||
+                                        strings.Contains(low, "no route to host") ||
+                                        strings.Contains(low, "connection reset") ||
+                                        strings.Contains(low, "exitonforwardfailure") {
+                                        debugLog("TUNNEL", "TEST: terminal error on %s: %s", host, stderrStr)
+                                        return false
+                                }
+                        }
+                }
+        }
+}
+
 // startSSHTunnel starts the SSH tunnel with default retries (chain length 1)
 func startSSHTunnel(sshCmd []string) bool {
         return startSSHTunnelWithRetries(sshCmd, 1)

@@ -75,3 +75,16 @@ func checkProxyConnectivity() bool {
         conn.Close()
         return true
 }
+
+// checkProxyConnectivityOnPort verifies if a SOCKS5 proxy is listening on the given port.
+// Used for pre-flight testing of a tunnel on a temporary port without affecting
+// the production tunnel.
+func checkProxyConnectivityOnPort(port int) bool {
+        addr := fmt.Sprintf("127.0.0.1:%d", port)
+        conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+        if err != nil {
+                return false
+        }
+        conn.Close()
+        return true
+}
