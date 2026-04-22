@@ -25,6 +25,18 @@ func updateTrayStatusOnline(remoteAlias, displayHost string) {
 	}
 }
 
+// updateTrayStatusFailover updates tray with failover status (connected to backup host).
+// Shows green icon with "(Failover)" indicator.
+func updateTrayStatusFailover(remoteAlias, displayHost string) {
+	iconData := loadIconData(color.RGBA{0, 255, 0, 255})
+	if iconData != nil {
+		systray.SetIcon(iconData)
+	}
+
+	systray.SetTitle(fmt.Sprintf("Online -> %s (Failover)", remoteAlias))
+	systray.SetTooltip(fmt.Sprintf("%s: FAILOVER\n%s\nWaiting for original chain to recover...", remoteAlias, displayHost))
+}
+
 // updateTrayStatusReconnecting updates tray with reconnecting status
 func updateTrayStatusReconnecting(remoteAlias, displayHost string) {
 	iconData := loadIconData(color.RGBA{255, 255, 0, 255})

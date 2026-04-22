@@ -27,7 +27,7 @@ var monitoringGeneration uint64
 
 // ---------------------------------------------------------------------------
 // monitoringConfig — holds all timing and mutable state for a single
-// monitoring session, replacing 7 loose local variables.
+// monitoring session, replacing loose local variables.
 // ---------------------------------------------------------------------------
 
 type monitoringConfig struct {
@@ -40,16 +40,20 @@ type monitoringConfig struct {
 	origHostCheckInterval time.Duration
 
 	// Mutable session state
-	isReconnecting       bool
-	isFatalError         bool
+	failState            FailoverState
 	reconnectStartTime   time.Time
 	lastInternetCheck    time.Time
 	lastReconnectAttempt time.Time
 	lastSocksCheck       time.Time
 	lastOrigHostCheck    time.Time
+	lastChainCheck       time.Time
 	lastPriorityCheck    time.Time
 	networkAvailable     bool
 	reconnectAttempts    int
+
+	// Failover / recovery state
+	originalChainState *ProxyState // saved when entering Failover (for chain recovery)
+	failoverAttempts   int         // how many hosts we've tried in current Failover cycle
 }
 
 func newMonitoringConfig() *monitoringConfig {
@@ -60,12 +64,12 @@ func newMonitoringConfig() *monitoringConfig {
 		reconnectDelay:        time.Duration(Config.Network.ReconnectAttemptDelay) * time.Second,
 		maxReconnectTime:      time.Duration(Config.Network.MaxReconnectTime) * time.Second,
 		origHostCheckInterval: time.Duration(Config.General.OriginalHostCheck) * time.Second,
+		failState:             StateNormal,
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Tray-display helpers — eliminate the repeated "if chain / else" pattern
-// that appeared 6 times in the original startMonitoring().
+// Tray-display helpers
 // ---------------------------------------------------------------------------
 
 // aliasForState returns the short label used in tray title/tooltip for a connection.
@@ -85,70 +89,199 @@ func remoteForState(state *ProxyState) string {
 }
 
 // ---------------------------------------------------------------------------
+// Chain host reachability helpers
+// ---------------------------------------------------------------------------
+
+// checkChainHostsReachable checks if all hosts in the chain are reachable via SSH.
+// Returns (allReachable, list of unavailable host names).
+// For reverse hosts (with ProxyJump), checks the ProxyJump target instead.
+func checkChainHostsReachable(chainHostNames []string) (bool, []string) {
+	if len(chainHostNames) == 0 {
+		return true, nil
+	}
+
+	hosts := parseSSHConfig(Config.Paths.SSHConfig)
+	hostMap := make(map[string]HostConfig)
+	for _, h := range hosts {
+		hostMap[h.Name] = h
+	}
+
+	// Build deduplicated list of effective hosts to check.
+	// For reverse hosts, check their ProxyJump target; for direct hosts, check them directly.
+	type checkTarget struct {
+		name   string
+		config HostConfig
+	}
+	seen := make(map[string]bool)
+	var targets []checkTarget
+
+	for _, name := range chainHostNames {
+		h, ok := hostMap[name]
+		if !ok {
+			// Host not found in SSH config — consider unavailable
+			debugLog("MONITOR", "Chain host %q not found in SSH config", name)
+			return false, []string{name}
+		}
+
+		effectiveName := name
+		if isReverseHost(h) && h.ProxyJump != "" {
+			effectiveName = h.ProxyJump
+		}
+
+		if !seen[effectiveName] {
+			seen[effectiveName] = true
+			if ec, ok := hostMap[effectiveName]; ok {
+				targets = append(targets, checkTarget{name: effectiveName, config: ec})
+			} else {
+				// ProxyJump target not found in config
+				debugLog("MONITOR", "Chain host %q ProxyJump target %q not found", name, effectiveName)
+				return false, []string{effectiveName}
+			}
+		}
+	}
+
+	// Check all targets in parallel (max 3 concurrent)
+	results := checkSSHConnectionBatch(
+		func() []HostConfig {
+			var hs []HostConfig
+			for _, t := range targets {
+				hs = append(hs, t.config)
+			}
+			return hs
+		}(),
+		Config.Paths.WorkDir,
+	)
+
+	var unavailable []string
+	for _, t := range targets {
+		if !results[t.name] {
+			unavailable = append(unavailable, t.name)
+		}
+	}
+
+	return len(unavailable) == 0, unavailable
+}
+
+// attemptChainRecovery tries to re-establish the original chain connection.
+// Called from Recovery state when all original chain hosts are verified reachable.
+// Does NOT start new monitoring — the caller continues managing the state.
+func attemptChainRecovery(originalState *ProxyState) bool {
+	if originalState == nil {
+		return false
+	}
+
+	chainHostNames := originalState.ChainHosts
+	isChain := originalState.IsChain
+
+	if !isChain || len(chainHostNames) == 0 {
+		// Single host original — handled by checkAndReturnToOriginalHost
+		return false
+	}
+
+	// Resolve chain hosts from SSH config
+	hosts := parseSSHConfig(Config.Paths.SSHConfig)
+	hostMap := make(map[string]HostConfig)
+	for _, h := range hosts {
+		hostMap[h.Name] = h
+	}
+
+	var chain []HostConfig
+	for _, name := range chainHostNames {
+		h, ok := hostMap[name]
+		if !ok {
+			debugLog("MONITOR", "Chain recovery: host %q not found in SSH config", name)
+			return false
+		}
+		chain = append(chain, h)
+	}
+
+	if len(chain) != len(chainHostNames) {
+		debugLog("MONITOR", "Chain recovery: could not resolve all chain hosts")
+		return false
+	}
+
+	// Build display string
+	var names []string
+	for _, h := range chain {
+		names = append(names, h.Name)
+	}
+	chainDisplay := strings.Join(names, " -> ")
+
+	logTunnelEvent("INFO", chainDisplay, "Attempting to restore original chain")
+
+	// Connect WITHOUT starting new monitoring and WITHOUT stopping current monitoring
+	result := establishConnection(ConnectOptions{
+		Hosts:              chain,
+		IsChain:            true,
+		OriginalHost:       originalState.OriginalHost,
+		StopMonitoring:     false, // don't stop ourselves
+		KillExistingTunnel: true,
+		EnableSystemProxy:  true,
+		SaveLastHost:       true,
+		StartMonitoring:    false, // don't start new monitoring
+		UpdateTray:         true,
+		DisplayAlias:       "Chain",
+		DisplayTooltip:     chainDisplay,
+	})
+
+	if result != nil {
+		logTunnelEvent("OK", chainDisplay, "Original chain restored successfully")
+		return true
+	}
+
+	logTunnelEvent("WARN", chainDisplay, "Failed to restore original chain, staying in Recovery")
+	return false
+}
+
+// ---------------------------------------------------------------------------
 // State handlers — one method per monitoring state
 // ---------------------------------------------------------------------------
 
-// checkOriginalHostReturn periodically checks if the original host is
-// available and attempts to return when in failover mode.
-// Returns true if the caller should exit monitoring (successfully returned).
-func (mc *monitoringConfig) checkOriginalHostReturn(state *ProxyState) bool {
-	if !Config.General.ReturnToOriginalHost || !state.IsFailoverActive {
-		return false
+// handleNormalState checks SOCKS5 and chain hosts periodically.
+// When the tunnel drops or any chain host becomes unreachable, transitions to Failover.
+func (mc *monitoringConfig) handleNormalState(state *ProxyState) {
+	// ── 1. Periodic chain host monitoring ──
+	// Check all hosts in the active chain for reachability.
+	// This detects failures even if SSH is in a zombie state (process alive but not working).
+	chainCheckInterval := mc.origHostCheckInterval
+	if chainCheckInterval < 30*time.Second {
+		chainCheckInterval = 30 * time.Second
 	}
-	if mc.origHostCheckInterval == 0 || time.Since(mc.lastOrigHostCheck) < mc.origHostCheckInterval {
-		return false
+
+	if time.Since(mc.lastChainCheck) >= chainCheckInterval {
+		mc.lastChainCheck = time.Now()
+
+		// Determine which hosts to check
+		var chainHostNames []string
+		if state.IsChain && len(state.ChainHosts) > 0 {
+			chainHostNames = state.ChainHosts
+		} else {
+			// Single host — check just that host
+			chainHostNames = []string{state.Host}
+		}
+
+		allOk, failedHosts := checkChainHostsReachable(chainHostNames)
+		if !allOk {
+			logTunnelEvent("ERROR", state.Host,
+				fmt.Sprintf("Chain host(s) unavailable: %v — entering Failover", failedHosts))
+			mc.enterFailoverState(state)
+			return
+		}
+		debugLog("MONITOR", "Chain hosts check: all OK (%d hosts)", len(chainHostNames))
 	}
-	mc.lastOrigHostCheck = time.Now()
 
-	return checkAndReturnToOriginalHostFunc(state)
-}
-
-// handleFatalErrorState periodically pings SOCKS5; if the tunnel recovers on
-// its own the state resets to normal.
-func (mc *monitoringConfig) handleFatalErrorState(state *ProxyState) {
+	// ── 2. SOCKS5 connectivity check ──
 	if time.Since(mc.lastSocksCheck) < mc.socksCheckInterval {
 		return
 	}
 	mc.lastSocksCheck = time.Now()
 
 	if checkProxyConnectivityFunc() {
-		mc.isFatalError = false
-		mc.isReconnecting = false
-		mc.reconnectAttempts = 0
-		connState.SetStartTime(time.Now())
-		connState.SetActive(true)
-		logTunnelEvent("OK", state.Host, "Tunnel recovered from fatal error state")
-		updateTrayStatusOnline(aliasForState(state), remoteForState(state))
-		updateMenuState()
-	}
-}
-
-// handleNormalState checks SOCKS5 periodically.  When the tunnel drops it
-// transitions into reconnection state and optionally triggers smart failover.
-// Returns true if the caller (startMonitoring) should exit the goroutine
-// entirely — this happens after a successful smart failover where a NEW
-// monitoring session has already been started by the failover pipeline.
-func (mc *monitoringConfig) handleNormalState(state *ProxyState) bool {
-	if time.Since(mc.lastSocksCheck) < mc.socksCheckInterval {
-		return false
-	}
-	mc.lastSocksCheck = time.Now()
-
-	if checkProxyConnectivityFunc() {
-		// Tunnel is online — if we were reconnecting, mark as recovered
-		if mc.isReconnecting {
-			mc.isReconnecting = false
-			mc.reconnectAttempts = 0
-			connState.SetStartTime(time.Now())
-			connState.SetActive(true)
-			logTunnelEvent("OK", state.Host, "Tunnel reconnected successfully")
-			updateMenuState()
-		}
+		// Tunnel is online
 
 		// Check priority host availability periodically
 		if hasPriorityHost && connState.GetHost() != priorityHost && time.Since(mc.lastPriorityCheck) >= mc.origHostCheckInterval {
 			mc.lastPriorityCheck = time.Now()
-			// Check if priority host is available
 			hosts := parseSSHConfig(Config.Paths.SSHConfig)
 			var priorityHostConfig *HostConfig
 			for _, h := range hosts {
@@ -175,135 +308,291 @@ func (mc *monitoringConfig) handleNormalState(state *ProxyState) bool {
 						logTunnelEvent("ERROR", priorityHost, "Failed to switch to priority host")
 					} else {
 						logTunnelEvent("OK", priorityHost, "Switched to priority host")
-						return true // exit monitoring, new session started
 					}
+					return
 				}
 			}
 		}
 
+		return
+	}
+
+	// ── 3. Tunnel went offline ──
+	logTunnelEvent("ERROR", state.Host, "Tunnel lost connection (SOCKS5 not responding)")
+	mc.enterFailoverState(state)
+}
+
+// enterFailoverState saves the original chain state and transitions to Failover.
+func (mc *monitoringConfig) enterFailoverState(state *ProxyState) {
+	// Save original state for recovery
+	stateCopy := *state
+	mc.originalChainState = &stateCopy
+	mc.failoverAttempts = 0
+
+	// Transition to Failover
+	mc.failState = StateFailover
+	connState.SetFailState(StateFailover)
+	connState.SetActive(false)
+
+	debugLog("MONITOR", "Entering Failover state from Normal (original host: %s)", state.Host)
+	updateTrayStatusReconnecting(aliasForState(state), remoteForState(state))
+	updateMenuState()
+}
+
+// handleFailoverState finds the fastest available host and connects to it.
+// On success → transitions to Recovery.
+// If all hosts fail → transitions to ErrorHalt.
+func (mc *monitoringConfig) handleFailoverState(state *ProxyState) bool {
+	debugLog("MONITOR", "handleFailoverState: attempt %d", mc.failoverAttempts+1)
+
+	// ── 1. Gather available hosts (all groups, exclude current and reverse) ──
+	hosts := parseSSHConfig(Config.Paths.SSHConfig)
+	if len(hosts) == 0 {
+		mc.enterErrorHalt(state, "No hosts found in SSH config")
 		return false
 	}
 
-	// Tunnel went offline
-	if mc.isReconnecting {
-		return false // already handling
+	// Determine which host to exclude (the one that just failed)
+	excludeHost := ""
+	if mc.originalChainState != nil {
+		excludeHost = mc.originalChainState.Host
 	}
 
-	mc.isReconnecting = true
-	mc.reconnectStartTime = time.Now()
-	mc.lastInternetCheck = time.Time{}
-	mc.lastReconnectAttempt = time.Time{}
-	mc.reconnectAttempts = 0
-	connState.SetActive(false)
-	debugLog("MONITOR", "Tunnel lost, isReconnecting=true, smartFailover=%v", Config.General.SmartFailover)
-	logTunnelEvent("ERROR", state.Host, "Tunnel lost connection")
-	updateMenuState()
-
-	// Try smart failover if enabled (single-host only)
-	if Config.General.SmartFailover && !state.IsChain {
-		if handleSmartFailover(state) {
-			// Failover succeeded — a new monitoring session has been started
-			// inside establishConnection. We must exit THIS goroutine to
-			// prevent the orphan from killing the new tunnel via PID file.
-			return true
+	var availableHosts []HostConfig
+	for _, h := range hosts {
+		// Exclude the host/chain that just failed
+		if h.Name == excludeHost {
+			continue
 		}
+		// Exclude reverse hosts (they need a jumper that might be down)
+		if isReverseHost(h) {
+			continue
+		}
+		availableHosts = append(availableHosts, h)
 	}
 
-	updateTrayStatusReconnecting(aliasForState(state), remoteForState(state))
-	disableSystemProxy()
-	killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
+	if len(availableHosts) == 0 {
+		logTunnelEvent("ERROR", state.Host, "No alternative hosts available for failover")
+		mc.enterErrorHalt(state, "No alternative hosts available")
+		return false
+	}
+
+	// ── 2. Find and connect to the fastest available host ──
+	logTunnelEvent("INFO", state.Host, fmt.Sprintf("Looking for fastest among %d available hosts...", len(availableHosts)))
+	fastestHost, responseTime := findFastestAvailableHost(availableHosts, Config.Paths.WorkDir)
+
+	if fastestHost == nil {
+		logTunnelEvent("WARN", state.Host, "No reachable hosts found for failover")
+		mc.failoverAttempts++
+		if mc.failoverAttempts >= 3 {
+			mc.enterErrorHalt(state, "All failover attempts exhausted")
+			return false
+		}
+		return false
+	}
+
+	responseTimeSec := responseTime.Seconds()
+	logTunnelEvent("INFO", state.Host,
+		fmt.Sprintf("Fastest host: %s (%.2fs), connecting...", fastestHost.Name, responseTimeSec))
+
+	updateTrayStatusReconnecting(fastestHost.Name, fastestHost.HostName)
+
+	// ── 3. Connect to failover host (DON'T stop/start monitoring) ──
+	originalHost := state.Host
+	if mc.originalChainState != nil {
+		originalHost = mc.originalChainState.OriginalHost
+	}
+
+	result := establishConnection(ConnectOptions{
+		Hosts:              []HostConfig{*fastestHost},
+		OriginalHost:       originalHost,
+		IsFailoverActive:   true,
+		FailoverStart:      time.Now().Format(time.RFC3339),
+		StopMonitoring:     false, // don't stop ourselves
+		KillExistingTunnel: true,
+		EnableSystemProxy:  true,
+		SaveLastHost:       false,
+		StartMonitoring:    false, // don't start new monitoring
+		UpdateTray:         true,
+		DisplayAlias:       fastestHost.Name,
+		DisplayTooltip:     fastestHost.HostName,
+	})
+
+	if result != nil {
+		logTunnelEvent("OK", state.Host,
+			fmt.Sprintf("Failover successful: switched to %s", fastestHost.Name))
+
+		// Transition to Recovery — we're now on a failover host,
+		// periodically checking if the original chain can be restored.
+		mc.failState = StateRecovery
+		connState.SetFailState(StateRecovery)
+		mc.lastOrigHostCheck = time.Time{} // reset to check immediately
+
+		debugLog("MONITOR", "Failover → Recovery (failover host: %s)", fastestHost.Name)
+		return false
+	}
+
+	// Connection to this host failed, try again next tick
+	logTunnelEvent("ERROR", fastestHost.Name, "Failed to connect to failover host")
+	mc.failoverAttempts++
+	if mc.failoverAttempts >= 5 {
+		mc.enterErrorHalt(state, "Exhausted failover attempts (5)")
+		return false
+	}
+
 	return false
 }
 
-// handleReconnectionState manages the reconnect cycle: wait for internet,
-// then periodically attempt tunnel restart until max time is reached.
-func (mc *monitoringConfig) handleReconnectionState(state *ProxyState) {
-	// First — check if the tunnel recovered on its own (e.g. SSH auto-reconnect).
-	// This preserves the original behaviour where the SOCKS check ran in every state.
+// handleRecoveryState monitors the failover host and periodically checks
+// if all original chain hosts are available for restoration.
+// When all original hosts are verified → re-establishes original chain → Normal.
+// If failover host drops → back to Failover.
+func (mc *monitoringConfig) handleRecoveryState(state *ProxyState) bool {
+	// ── 1. Check failover host (SOCKS5) ──
 	if time.Since(mc.lastSocksCheck) >= mc.socksCheckInterval {
 		mc.lastSocksCheck = time.Now()
-		if checkProxyConnectivityFunc() {
-			mc.isReconnecting = false
-			mc.reconnectAttempts = 0
-			connState.SetStartTime(time.Now())
-			connState.SetActive(true)
-			logTunnelEvent("OK", state.Host, "Tunnel recovered on its own during reconnection")
-			updateTrayStatusOnline(aliasForState(state), remoteForState(state))
+
+		if !checkProxyConnectivityFunc() {
+			// Failover host itself dropped — return to Failover state
+			logTunnelEvent("ERROR", state.Host, "Failover host lost connection, returning to Failover state")
+			mc.failState = StateFailover
+			connState.SetFailState(StateFailover)
+			connState.SetActive(false)
+			mc.failoverAttempts = 0
+			updateTrayStatusReconnecting(aliasForState(state), remoteForState(state))
 			updateMenuState()
-			pacURL := fmt.Sprintf("http://127.0.0.1:%d/x_proxy.pac", Config.Network.PACHttpPort)
-			setSystemProxy(pacURL)
-			return
+			return false
 		}
 	}
 
-	// Check max reconnection time
-	if time.Since(mc.reconnectStartTime) > mc.maxReconnectTime {
-		logTunnelEvent("ERROR", state.Host,
-			fmt.Sprintf("Max reconnection time exceeded (%d seconds)", Config.Network.MaxReconnectTime))
-		handleFatalError(state.Host, state.RemoteHost)
-		mc.isFatalError = true
-		mc.isReconnecting = false
-		connState.SetActive(false)
-		updateMenuState()
-		return
+	// ── 2. Periodically check if original chain can be restored ──
+	if mc.origHostCheckInterval == 0 || time.Since(mc.lastOrigHostCheck) < mc.origHostCheckInterval {
+		return false
+	}
+	mc.lastOrigHostCheck = time.Now()
+
+	if mc.originalChainState == nil {
+		// No original state saved — nothing to recover
+		return false
 	}
 
-	// Wait for internet-check delay before starting network probes
-	if time.Since(mc.reconnectStartTime) < mc.internetCheckDelay {
-		return
-	}
+	origState := mc.originalChainState
 
-	// Check internet connectivity (respecting retry interval)
-	if time.Since(mc.lastInternetCheck) >= mc.internetCheckRetry {
-		mc.lastInternetCheck = time.Now()
-		mc.networkAvailable = checkInternetFunc()
+	if origState.IsChain && len(origState.ChainHosts) > 0 {
+		// ── Chain recovery: check ALL hosts in the original chain ──
+		allOk, failedHosts := checkChainHostsReachable(origState.ChainHosts)
 
-		if !mc.networkAvailable {
-			logTunnelEvent("WARN", state.Host, "No internet connectivity detected")
-			updateTrayStatusNoInternet(aliasForState(state), remoteForState(state),
-				time.Since(mc.reconnectStartTime), mc.maxReconnectTime)
-			return
+		if allOk {
+			logTunnelEvent("INFO", state.Host,
+				fmt.Sprintf("All original chain hosts are reachable, attempting chain restoration"))
+			if attemptChainRecovery(origState) {
+				// Chain restored — transition to Normal
+				mc.failState = StateNormal
+				connState.SetFailState(StateNormal)
+				connState.SetActive(true)
+				mc.originalChainState = nil // clear saved state
+
+				logTunnelEvent("OK", origState.Host, "Original chain restored — returning to Normal state")
+				updateMenuState()
+				return false
+			}
+			// Chain restoration failed — stay in Recovery, will retry next cycle
+		} else {
+			debugLog("MONITOR", "Recovery: chain hosts still unavailable: %v", failedHosts)
 		}
-	} else if !mc.networkAvailable {
-		updateTrayStatusNoInternet(aliasForState(state), remoteForState(state),
-			time.Since(mc.reconnectStartTime), mc.maxReconnectTime)
-		return
+	} else {
+		// ── Single host recovery: check original host ──
+		origName := origState.OriginalHost
+		if origName == "" {
+			origName = origState.Host
+		}
+
+		hosts := parseSSHConfig(Config.Paths.SSHConfig)
+		var origConfig *HostConfig
+		for _, h := range hosts {
+			if h.Name == origName {
+				origConfig = &h
+				break
+			}
+		}
+
+		if origConfig == nil {
+			debugLog("MONITOR", "Recovery: original host %q not found in SSH config", origName)
+			return false
+		}
+
+		available, responseTime := checkSSHConnectionWithTime(*origConfig, Config.Paths.WorkDir)
+		if available {
+			logTunnelEvent("INFO", state.Host,
+				fmt.Sprintf("Original host %s is available (%.2fs), restoring...", origName, responseTime.Seconds()))
+
+			// Connect to original host WITHOUT stopping/starting monitoring
+			result := establishConnection(ConnectOptions{
+				Hosts:              []HostConfig{*origConfig},
+				OriginalHost:       origName,
+				StopMonitoring:     false, // don't stop ourselves
+				KillExistingTunnel: true,
+				EnableSystemProxy:  true,
+				SaveLastHost:       true,
+				StartMonitoring:    false, // don't start new monitoring
+				UpdateTray:         true,
+				DisplayAlias:       origConfig.Name,
+				DisplayTooltip:     origConfig.HostName,
+			})
+
+			if result != nil {
+				// Original host restored — transition to Normal
+				mc.failState = StateNormal
+				connState.SetFailState(StateNormal)
+				connState.SetActive(true)
+				mc.originalChainState = nil // clear saved state
+
+				logTunnelEvent("OK", origName, "Returned to original host — Normal state")
+				updateMenuState()
+			} else {
+				logTunnelEvent("WARN", origName, "Failed to return to original host, staying in Recovery")
+			}
+		} else {
+			debugLog("MONITOR", "Recovery: original host %s still unavailable", origName)
+		}
 	}
 
-	// Internet is available — attempt reconnection (respecting attempt delay)
-	if time.Since(mc.lastReconnectAttempt) < mc.reconnectDelay {
+	return false
+}
+
+// handleFatalErrorState periodically pings SOCKS5; if the tunnel recovers on
+// its own the state resets to normal.
+func (mc *monitoringConfig) handleFatalErrorState(state *ProxyState) {
+	if time.Since(mc.lastSocksCheck) < mc.socksCheckInterval {
 		return
 	}
-	mc.lastReconnectAttempt = time.Now()
-	mc.reconnectAttempts++
-	debugLog("MONITOR", "Reconnect attempt %d", mc.reconnectAttempts)
+	mc.lastSocksCheck = time.Now()
 
-	remainingTime := mc.maxReconnectTime - time.Since(mc.reconnectStartTime)
-	logTunnelEvent("INFO", state.Host,
-		fmt.Sprintf("Reconnection attempt %d (%.0f minutes remaining)",
-			mc.reconnectAttempts, remainingTime.Minutes()))
-
-	updateTrayStatusAttempting(aliasForState(state), remoteForState(state),
-		mc.reconnectAttempts, remainingTime)
-
-	if attemptTunnelRestartFunc(state) {
-		mc.isReconnecting = false
-		mc.reconnectAttempts = 0
+	if checkProxyConnectivityFunc() {
+		// Tunnel recovered — reset to Normal
+		mc.failState = StateNormal
+		connState.SetFailState(StateNormal)
 		connState.SetStartTime(time.Now())
 		connState.SetActive(true)
-		logTunnelEvent("OK", state.Host, "Tunnel reestablished after reconnection")
+		logTunnelEvent("OK", state.Host, "Tunnel recovered from Error/Halt state")
 		updateTrayStatusOnline(aliasForState(state), remoteForState(state))
 		updateMenuState()
-		pacURL := fmt.Sprintf("http://127.0.0.1:%d/x_proxy.pac", Config.Network.PACHttpPort)
-		setSystemProxy(pacURL)
-	} else {
-		logTunnelEvent("ERROR", state.Host,
-			fmt.Sprintf("Reconnection attempt %d failed", mc.reconnectAttempts))
 	}
 }
 
+// enterErrorHalt transitions to Error/Halt state with red icon and stops operations.
+func (mc *monitoringConfig) enterErrorHalt(state *ProxyState, reason string) {
+	mc.failState = StateErrorHalt
+	connState.SetFailState(StateErrorHalt)
+	connState.SetActive(false)
+
+	logTunnelEvent("ERROR", state.Host, fmt.Sprintf("Entering Error/Halt: %s", reason))
+	handleFatalError(state.Host, state.RemoteHost)
+	updateMenuState()
+}
+
 // ---------------------------------------------------------------------------
-// startMonitoring — thin coordinator (was 280 lines, now ~30)
+// startMonitoring — coordinator with 4-state machine
 // ---------------------------------------------------------------------------
 
 // startMonitoring starts a new monitoring loop for the current connection.
@@ -322,9 +611,6 @@ func startMonitoring(state *ProxyState) {
 
 	defer func() {
 		monitoringMutex.Lock()
-		// Only clear monitoringActive if no newer monitoring session has started.
-		// This prevents an orphaned goroutine (e.g. after smart failover) from
-		// clearing the flag while a newer session is still running.
 		if monitoringGeneration == myGeneration {
 			monitoringActive = false
 		}
@@ -354,23 +640,27 @@ func startMonitoring(state *ProxyState) {
 				return
 			}
 
-			// Periodic original-host return check (failover mode)
-			if mc.checkOriginalHostReturn(state) {
-				return
-			}
+			// 4-state machine
+			switch mc.failState {
+			case StateNormal:
+				mc.handleNormalState(state)
 
-			// State machine
-			switch {
-			case mc.isFatalError:
-				mc.handleFatalErrorState(state)
-			case mc.isReconnecting:
-				mc.handleReconnectionState(state)
-			default:
-				if mc.handleNormalState(state) {
-					// Smart failover succeeded — a new monitoring session is
-					// already running for the failover host. Exit this goroutine.
-					return
+			case StateFailover:
+				mc.handleFailoverState(state)
+				// After failover connection, reload state from disk
+				if s, err := LoadState(); err == nil {
+					state = s
 				}
+
+			case StateRecovery:
+				mc.handleRecoveryState(state)
+				// After chain recovery, reload state from disk
+				if s, err := LoadState(); err == nil {
+					state = s
+				}
+
+			case StateErrorHalt:
+				mc.handleFatalErrorState(state)
 			}
 		}
 	}
@@ -494,7 +784,6 @@ func tryAutoConnectLastHost() {
 				fastestHost, _ := findFastestAvailableHost(availableHosts, Config.Paths.WorkDir)
 				if fastestHost != nil {
 					debugLog("MONITOR", "Fallback: switching to %s", fastestHost.Name)
-					// Connect to fastest host, but keep priority as original
 					safeGo(func() {
 						time.Sleep(2 * time.Second)
 						establishConnection(ConnectOptions{

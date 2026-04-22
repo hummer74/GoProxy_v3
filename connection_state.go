@@ -6,14 +6,40 @@ import (
 	"time"
 )
 
+// FailoverState represents the current failover/recovery state of the connection.
+type FailoverState int
+
+const (
+	StateNormal    FailoverState = iota // All hosts reachable, tunnel active on primary path
+	StateFailover                       // Host failed, switching to fastest available host
+	StateRecovery                       // On failover host, checking if original chain can be restored
+	StateErrorHalt                      // Critical unrecoverable error, system halted
+)
+
+// String returns a human-readable state name for logging.
+func (s FailoverState) String() string {
+	switch s {
+	case StateNormal:
+		return "Normal"
+	case StateFailover:
+		return "Failover"
+	case StateRecovery:
+		return "Recovery"
+	case StateErrorHalt:
+		return "ErrorHalt"
+	default:
+		return "Unknown"
+	}
+}
+
 // ConnectionState provides thread-safe access to the current tunnel connection state.
-// All three fields (host, active, startTime) are always updated together under a write lock
-// so that readers see a consistent snapshot.
+// All fields are always updated together under a write lock so that readers see a consistent snapshot.
 type ConnectionState struct {
-	mu      sync.RWMutex
-	host    string
-	active  bool
-	started time.Time
+	mu        sync.RWMutex
+	host      string
+	active    bool
+	started   time.Time
+	failState FailoverState
 }
 
 // connState is the single global instance of ConnectionState.
@@ -51,6 +77,13 @@ func (c *ConnectionState) SetActive(active bool) {
 	c.active = active
 }
 
+// SetFailState atomically sets the failover state.
+func (c *ConnectionState) SetFailState(state FailoverState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failState = state
+}
+
 // GetHost returns the currently connected host name (thread-safe read).
 func (c *ConnectionState) GetHost() string {
 	c.mu.RLock()
@@ -72,9 +105,16 @@ func (c *ConnectionState) GetStartTime() time.Time {
 	return c.started
 }
 
-// GetAll returns a consistent snapshot of all three fields (thread-safe read).
-func (c *ConnectionState) GetAll() (host string, active bool, started time.Time) {
+// GetFailState returns the current failover state (thread-safe read).
+func (c *ConnectionState) GetFailState() FailoverState {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.host, c.active, c.started
+	return c.failState
+}
+
+// GetAll returns a consistent snapshot of all fields (thread-safe read).
+func (c *ConnectionState) GetAll() (host string, active bool, started time.Time, failState FailoverState) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.host, c.active, c.started, c.failState
 }
