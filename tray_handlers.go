@@ -368,6 +368,9 @@ func handleKillProxy() {
         debugLog("HANDLER", "Kill proxy")
         logTunnelEvent("INFO", connState.GetHost(), "User requested to kill proxy")
 
+        // Invalidate any running connection attempts (cancel zombie retry loops)
+        nextTunnelGeneration()
+
         stopMonitoring()
         disableSystemProxy()
         killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")

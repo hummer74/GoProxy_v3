@@ -53,7 +53,9 @@ type ConnectOptions struct {
 //
 // Returns the ProxyState on success, nil on failure.
 func establishConnection(opts ConnectOptions) *ProxyState {
-        debugLog("PIPELINE", "establishConnection: %d hosts, isChain=%v", len(opts.Hosts), opts.IsChain)
+        // Invalidate any previous connection attempts (cancel zombie retry loops)
+        gen := nextTunnelGeneration()
+        debugLog("PIPELINE", "establishConnection: %d hosts, isChain=%v, gen=%d", len(opts.Hosts), opts.IsChain, gen)
         // ── 1. Pre-connect cleanup ──────────────────────────────────────────
         if opts.StopMonitoring {
                 stopMonitoring()
