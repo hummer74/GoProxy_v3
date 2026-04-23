@@ -196,7 +196,8 @@ func finishConnection(state ProxyState, alias, tooltip string, opts ConnectOptio
         debugLog("PIPELINE", "finishConnection: %s", alias)
         // PAC + system proxy
         if opts.EnableSystemProxy {
-                startPACServer()
+                startPACServer()         // generate & write PAC file to disk
+                startPACServerInternal() // start HTTP server to serve the PAC file
                 pacURL := fmt.Sprintf("http://127.0.0.1:%d/x_proxy.pac", Config.Network.PACHttpPort)
                 setSystemProxy(pacURL)
         }

@@ -3,9 +3,13 @@ package main
 
 import (
         "fmt"
+        "image/color"
+        "net/http"
         "os"
         "strings"
         "time"
+
+        "github.com/getlantern/systray"
 )
 
 var checkAndReturnToOriginalHostFunc func(*ProxyState) bool
@@ -54,6 +58,10 @@ type monitoringConfig struct {
         // Failover / recovery state
         originalChainState *ProxyState // saved when entering Failover (for chain recovery)
         failoverAttempts   int         // how many hosts we've tried in current Failover cycle
+
+        // NoInternet state
+        noInternetStart time.Time // when we entered StateNoInternet
+        noInternetMax   time.Duration // max wait time (24h)
 }
 
 func newMonitoringConfig() *monitoringConfig {
@@ -680,15 +688,132 @@ func (mc *monitoringConfig) handleFatalErrorState(state *ProxyState) {
         }
 }
 
-// enterErrorHalt transitions to Error/Halt state with red icon and stops operations.
+// handleNoInternetState waits for internet connectivity to return.
+// Checks every 1 minute, up to 24 hours.
+// When internet returns → attempts auto-connect like program startup.
+// When 24h expires → transitions to ErrorHalt.
+func (mc *monitoringConfig) handleNoInternetState(state *ProxyState) {
+        elapsed := time.Since(mc.noInternetStart)
+
+        // Check timeout (24 hours)
+        if elapsed >= mc.noInternetMax {
+                logTunnelEvent("ERROR", state.Host,
+                        fmt.Sprintf("NoInternet: 24h wait expired — entering Error/Halt"))
+                mc.failState = StateErrorHalt
+                connState.SetFailState(StateErrorHalt)
+
+                systray.SetTitle("FATAL ERROR")
+                systray.SetTooltip(fmt.Sprintf("%s: ERROR/HALT\nNo internet for 24h", state.Host))
+                updateMenuState()
+                return
+        }
+
+        // Check internet every 1 minute
+        if elapsed < 1*time.Minute {
+                // First check happens after 1 minute
+                return
+        }
+
+        // Throttle to 1-minute intervals using lastSocksCheck
+        if time.Since(mc.lastSocksCheck) < 1*time.Minute {
+                return
+        }
+        mc.lastSocksCheck = time.Now()
+
+        logTunnelEvent("INFO", state.Host,
+                fmt.Sprintf("NoInternet: checking internet (%.0f min elapsed)...", elapsed.Minutes()))
+
+        alias := aliasForState(state)
+        remote := remoteForState(state)
+        updateTrayStatusNoInternet(alias, remote, elapsed, mc.noInternetMax)
+
+        if !checkInternetDirect() {
+                debugLog("MONITOR", "NoInternet: still no connectivity")
+                return
+        }
+
+        // Internet is back!
+        logTunnelEvent("OK", state.Host, "NoInternet: internet connectivity restored!")
+
+        // Attempt auto-connect like program startup
+        killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
+
+        // tryAutoConnectLastHost runs in its own goroutine and starts monitoring
+        // We need to stop the current monitoring session so tryAutoConnectLastHost
+        // can start fresh. But we can't stop ourselves — so we transition to
+        // Normal state and let tryAutoConnectLastHost handle everything.
+        mc.failState = StateNormal
+        connState.SetFailState(StateNormal)
+
+        systray.SetTitle("Internet restored — reconnecting...")
+        updateMenuState()
+
+        logTunnelEvent("INFO", state.Host, "NoInternet: launching tryAutoConnectLastHost")
+        go tryAutoConnectLastHost()
+}
+
+// enterErrorHalt transitions to Error/Halt or NoInternet depending on connectivity.
+// If internet is available → true ErrorHalt (all hosts really are down).
+// If internet is NOT available → StateNoInternet (wait for network, then auto-restore).
 func (mc *monitoringConfig) enterErrorHalt(state *ProxyState, reason string) {
-        mc.failState = StateErrorHalt
-        connState.SetFailState(StateErrorHalt)
+        logTunnelEvent("ERROR", state.Host, fmt.Sprintf("All hosts failed: %s — checking internet...", reason))
+
+        // Immediately disable proxy and kill tunnel — no point keeping them alive
+        disableSystemProxy()
+        killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
         connState.SetActive(false)
 
-        logTunnelEvent("ERROR", state.Host, fmt.Sprintf("Entering Error/Halt: %s", reason))
-        handleFatalError(state.Host, state.RemoteHost)
+        // Check if internet is available (direct, without proxy)
+        if checkInternetDirect() {
+                // Internet works but all hosts are down → true ErrorHalt
+                logTunnelEvent("ERROR", state.Host, "Internet is available but all hosts unreachable — entering Error/Halt")
+
+                mc.failState = StateErrorHalt
+                connState.SetFailState(StateErrorHalt)
+
+                iconData := loadIconData(color.RGBA{255, 0, 0, 255})
+                if iconData != nil {
+                        systray.SetIcon(iconData)
+                }
+                systray.SetTitle("FATAL ERROR")
+                systray.SetTooltip(fmt.Sprintf("%s: ERROR/HALT\n%s\nManual intervention required", state.Host, state.RemoteHost))
+                updateMenuState()
+                return
+        }
+
+        // No internet → enter NoInternet state
+        logTunnelEvent("WARN", state.Host, "No internet connectivity — entering NoInternet state (24h wait)")
+
+        mc.failState = StateNoInternet
+        mc.noInternetStart = time.Now()
+        mc.noInternetMax = 24 * time.Hour
+        connState.SetFailState(StateNoInternet)
+
+        alias := aliasForState(state)
+        remote := remoteForState(state)
+        updateTrayStatusNoInternet(alias, remote, 0, mc.noInternetMax)
         updateMenuState()
+}
+
+// checkInternetDirect checks internet connectivity without using the proxy.
+// Performs a direct HTTP request to known-good endpoints.
+func checkInternetDirect() bool {
+        testURLs := []string{
+                "https://clients1.google.com/generate_204",
+                "http://connectivitycheck.gstatic.com/generate_204",
+        }
+
+        client := &http.Client{Timeout: 5 * time.Second}
+        for _, url := range testURLs {
+                resp, err := client.Get(url)
+                if err == nil {
+                        resp.Body.Close()
+                        if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+                                return true
+                        }
+                }
+        }
+        return false
 }
 
 // ---------------------------------------------------------------------------
@@ -740,7 +865,7 @@ func startMonitoring(state *ProxyState) {
                                 return
                         }
 
-                        // 4-state machine
+                        // 5-state machine
                         switch mc.failState {
                         case StateNormal:
                                 mc.handleNormalState(state)
@@ -758,6 +883,9 @@ func startMonitoring(state *ProxyState) {
                                 if s, err := LoadState(); err == nil {
                                         state = s
                                 }
+
+                        case StateNoInternet:
+                                mc.handleNoInternetState(state)
 
                         case StateErrorHalt:
                                 mc.handleFatalErrorState(state)
