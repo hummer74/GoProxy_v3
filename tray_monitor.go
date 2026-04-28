@@ -73,6 +73,7 @@ func newMonitoringConfig() *monitoringConfig {
                 reconnectDelay:        time.Duration(Config.Network.ReconnectAttemptDelay) * time.Second,
                 maxReconnectTime:      time.Duration(Config.Network.MaxReconnectTime) * time.Second,
                 origHostCheckInterval: time.Duration(Config.General.OriginalHostCheck) * time.Second,
+                lastPriorityCheck:     time.Now(), // don't fire priority check immediately on first tick
                 failState:             StateNormal,
         }
 }
@@ -326,8 +327,9 @@ func (mc *monitoringConfig) handleNormalState(state *ProxyState) {
         if checkProxyConnectivityFunc() {
                 // Tunnel is online
 
-                // Check priority host availability periodically
-                if hasPriorityHost && connState.GetHost() != priorityHost && time.Since(mc.lastPriorityCheck) >= mc.origHostCheckInterval {
+                // Check priority host availability periodically — only when
+                // this connection is a failover (not a user-initiated manual switch).
+                if hasPriorityHost && state.IsFailoverActive && connState.GetHost() != priorityHost && time.Since(mc.lastPriorityCheck) >= mc.origHostCheckInterval {
                         mc.lastPriorityCheck = time.Now()
                         hosts := parseSSHConfig(Config.Paths.SSHConfig)
                         var priorityHostConfig *HostConfig
