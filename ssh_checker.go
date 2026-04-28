@@ -1,13 +1,13 @@
 package main
 
 import (
-        "bytes"
-        "fmt"
-        "os/exec"
-        "strings"
-        "time"
+    "bytes"
+    "fmt"
+    "os/exec"
+    "strings"
+    "time"
 
-        windows "golang.org/x/sys/windows"
+    windows "golang.org/x/sys/windows"
 )
 
 // Function hooks for easier testing
@@ -17,285 +17,287 @@ var checkSSHConnectionWithTimeFn = checkSSHConnectionWithTime
 // Делегирует к checkSSHConnectionWithTime — единую каноническую реализацию.
 // Возвращает true если SSH сервер отвечает (даже если аутентификация не удалась).
 func checkSSHConnectionAdvanced(host HostConfig, workDir string) bool {
-        result, _ := checkSSHConnectionWithTimeFn(host, workDir)
-        return result
+    result, _ := checkSSHConnectionWithTimeFn(host, workDir)
+    return result
 }
 
 // checkSSHConnectionWithTime проверяет SSH соединение и возвращает время отклика
 // Возвращает true и время отклика, если хост доступен
 func checkSSHConnectionWithTime(host HostConfig, workDir string) (bool, time.Duration) {
-        testCmd := buildTestSSHCommand(host, workDir)
+    testCmd := buildTestSSHCommand(host, workDir)
 
-        if len(testCmd) == 0 {
-                logSSHError(host.Name, "INVALID_CONFIG", "Failed to build SSH test command")
-                return false, 0
-        }
+    if len(testCmd) == 0 {
+        logSSHError(host.Name, "INVALID_CONFIG", "Failed to build SSH test command")
+        return false, 0
+    }
 
-        startTime := time.Now()
+    startTime := time.Now()
 
-        cmd := exec.Command(testCmd[0], testCmd[1:]...)
-        cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+    cmd := exec.Command(testCmd[0], testCmd[1:]...)
+    cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 
-        var stdout, stderr bytes.Buffer
-        cmd.Stdout = &stdout
-        cmd.Stderr = &stderr
+    var stdout, stderr bytes.Buffer
+    cmd.Stdout = &stdout
+    cmd.Stderr = &stderr
 
-        // Запускаем команду
-        if err := cmd.Start(); err != nil {
-                logSSHError(host.Name, "PROCESS_START", fmt.Sprintf("Failed to start SSH process: %v", err))
-                return false, 0
-        }
+    // Запускаем команду
+    if err := cmd.Start(); err != nil {
+        logSSHError(host.Name, "PROCESS_START", fmt.Sprintf("Failed to start SSH process: %v", err))
+        return false, 0
+    }
 
-        // Таймаут на основе конфигурации (по умолчанию 5 секунд)
-        timeout := time.Duration(Config.General.FailoverResponseTime) * time.Second
-        if timeout == 0 {
-                timeout = 5 * time.Second
-        }
+    // Таймаут на основе конфигурации (по умолчанию 5 секунд)
+    timeout := time.Duration(Config.General.FailoverResponseTime) * time.Second
+    if timeout == 0 {
+        timeout = 5 * time.Second
+    }
 
-        done := make(chan error, 1)
-        go func() {
-                done <- cmd.Wait()
-        }()
+    done := make(chan error, 1)
+    go func() {
+        done <- cmd.Wait()
+    }()
 
-        select {
-        case err := <-done:
-                responseTime := time.Since(startTime)
+    select {
+    case err := <-done:
+        responseTime := time.Since(startTime)
 
-                if err != nil {
-                        // Команда завершилась с ошибкой
-                        errorStr := strings.ToLower(stderr.String())
+        if err != nil {
+            // Команда завершилась с ошибкой
+            errorStr := strings.ToLower(stderr.String())
 
-                        // Игнорируем некоторые ожидаемые ошибки
-                        if strings.Contains(errorStr, "permission denied") ||
-                                strings.Contains(errorStr, "authentication failed") ||
-                                strings.Contains(errorStr, "publickey") ||
-                                strings.Contains(errorStr, "key") {
-                                // Аутентификация не удалась, но SSH сервер отвечает
-                                return true, responseTime
-                        }
-
-                        // Проверяем, может ли это быть ошибка ключа
-                        if strings.Contains(errorStr, "private key") ||
-                                strings.Contains(errorStr, "no mutual signature algorithm") {
-                                return true, responseTime
-                        }
-
-                        // Проверяем ошибки сетевого уровня
-                        if strings.Contains(errorStr, "connection refused") ||
-                                strings.Contains(errorStr, "no route to host") ||
-                                strings.Contains(errorStr, "network is unreachable") {
-                                logSSHError(host.Name, "CONNECTION", errorStr)
-                                return false, 0
-                        }
-
-                        // Другие ошибки - хост недоступен
-                        return false, 0
-                }
-
-                // Команда завершилась успешно
+            // Игнорируем некоторые ожидаемые ошибки
+            if strings.Contains(errorStr, "permission denied") ||
+                strings.Contains(errorStr, "authentication failed") ||
+                strings.Contains(errorStr, "publickey") ||
+                strings.Contains(errorStr, "key") {
+                // Аутентификация не удалась, но SSH сервер отвечает
                 return true, responseTime
+            }
 
-        case <-time.After(timeout):
-                // Таймаут
-                if cmd.Process != nil {
-                        killPid(cmd.Process.Pid)
-                }
-                logSSHError(host.Name, "TIMEOUT", fmt.Sprintf("%v timeout exceeded", timeout))
+            // Проверяем, может ли это быть ошибка ключа
+            if strings.Contains(errorStr, "private key") ||
+                strings.Contains(errorStr, "no mutual signature algorithm") {
+                return true, responseTime
+            }
+
+            // Проверяем ошибки сетевого уровня
+            if strings.Contains(errorStr, "connection refused") ||
+                strings.Contains(errorStr, "no route to host") ||
+                strings.Contains(errorStr, "network is unreachable") {
+                logSSHError(host.Name, "CONNECTION", errorStr)
                 return false, 0
+            }
+
+            // Другие ошибки - хост недоступен
+            debugLog("CHECKER", "SSH check failed for %s: %s", host.Name, strings.TrimSpace(stderr.String()))
+            return false, 0
         }
+
+        // Команда завершилась успешно
+        return true, responseTime
+
+    case <-time.After(timeout):
+        // Таймаут
+        if cmd.Process != nil {
+            killPid(cmd.Process.Pid)
+        }
+        logSSHError(host.Name, "TIMEOUT", fmt.Sprintf("%v timeout exceeded", timeout))
+        return false, 0
+    }
 }
 
 // buildTestSSHCommand строит тестовую SSH команду для проверки соединения
 func buildTestSSHCommand(host HostConfig, workDir string) []string {
-        cmd := []string{"ssh"}
+    cmd := []string{"ssh"}
 
-        // Опции для проверки - такие же как в реальном подключении, но с более короткими таймаутами
-        cmd = append(cmd,
-                "-o", "AddressFamily=inet",
-                "-o", "BatchMode=yes", // Не запрашивать пароль
-                "-o", "ControlMaster=auto",
-                "-o", "TCPKeepAlive=no",
-                "-o", "ControlPersist=1m",
-                "-o", fmt.Sprintf("ConnectTimeout=%d", Config.General.FailoverResponseTime), // Таймаут подключения из конфига
-                "-o", "ServerAliveInterval=5", // Проверка активности
-                "-o", "ServerAliveCountMax=2", // Быстро отключаться если нет ответа
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=nul",
-                "-o", "ExitOnForwardFailure=yes",
-                "-o", "LogLevel=ERROR", // Только ошибки
-                "-o", "RequestTTY=no",
-        )
+    // Опции для проверки - такие же как в реальном подключении, но с более короткими таймаутами
+    cmd = append(cmd,
+        "-o", "AddressFamily=inet",
+        "-o", "BatchMode=yes", // Не запрашивать пароль
+        "-o", "ControlMaster=no", // Don't multiplex: Go pipes stdin/stdout, not sockets — causes "getsockname failed" on Windows SSH 9.x
+        "-o", "ControlPath=none", // Disable ControlPath lookup: stale sockets from previous sessions cause "getsockname failed" even with ControlMaster=no
+        "-o", "TCPKeepAlive=no",
+        "-o", "ControlPersist=no",
+        "-o", fmt.Sprintf("ConnectTimeout=%d", Config.General.FailoverResponseTime), // Таймаут подключения из конфига
+        "-o", "ServerAliveInterval=5", // Проверка активности
+        "-o", "ServerAliveCountMax=2", // Быстро отключаться если нет ответа
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=nul",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "LogLevel=ERROR", // Только ошибки
+        "-o", "RequestTTY=no",
+    )
 
-        // Add IdentitiesOnly if specified in config
-        if host.Params != nil && host.Params["identitiesonly"] == "yes" {
-                cmd = append(cmd, "-o", "IdentitiesOnly=yes")
+    // Add IdentitiesOnly if specified in config
+    if host.Params != nil && host.Params["identitiesonly"] == "yes" {
+        cmd = append(cmd, "-o", "IdentitiesOnly=yes")
+    }
+    if host.IdentityFile != "" {
+        sshKeyPath := resolveSSHKeyPath(workDir, host.IdentityFile)
+        if sshKeyPath != "" {
+            cmd = append(cmd, "-i", sshKeyPath)
         }
-        if host.IdentityFile != "" {
-                sshKeyPath := resolveSSHKeyPath(workDir, host.IdentityFile)
-                if sshKeyPath != "" {
-                        cmd = append(cmd, "-i", sshKeyPath)
-                }
-        }
+    }
 
-        // Порт
-        if host.Port != "" && host.Port != "22" {
-                cmd = append(cmd, "-p", host.Port)
-        }
+    // Порт
+    if host.Port != "" && host.Port != "22" {
+        cmd = append(cmd, "-p", host.Port)
+    }
 
-        // Пользователь
-        user := host.User
-        if user == "" {
-                user = "root"
-        }
+    // Пользователь
+    user := host.User
+    if user == "" {
+        user = "root"
+    }
 
-        // Хост
-        hostAddr := host.HostName
-        if hostAddr == "" {
-                return []string{} // Некорректный хост
-        }
+    // Хост
+    hostAddr := host.HostName
+    if hostAddr == "" {
+        return []string{} // Некорректный хост
+    }
 
-        // Формируем адрес подключения
-        target := fmt.Sprintf("%s@%s", user, hostAddr)
-        cmd = append(cmd, target)
+    // Формируем адрес подключения
+    target := fmt.Sprintf("%s@%s", user, hostAddr)
+    cmd = append(cmd, target)
 
-        // Простая команда для проверки (быстро завершается)
-        // Используем команду, которая работает на большинстве систем
-        cmd = append(cmd, "exit 0")
+    // Простая команда для проверки (быстро завершается)
+    // Используем команду, которая работает на большинстве систем
+    cmd = append(cmd, "exit 0")
 
-        return cmd
+    return cmd
 }
 
 // checkSSHConnectionBatch проверяет несколько хостов параллельно
 func checkSSHConnectionBatch(hosts []HostConfig, workDir string) map[string]bool {
-        debugLog("CHECKER", "Checking %d hosts (batch)", len(hosts))
-        results := make(map[string]bool)
+    debugLog("CHECKER", "Checking %d hosts (batch)", len(hosts))
+    results := make(map[string]bool)
 
-        // Если хостов немного, проверяем последовательно для лучшей диагностики
-        if len(hosts) <= 3 {
-                for _, host := range hosts {
-                        results[host.Name] = checkSSHConnectionAdvanced(host, workDir)
-                }
-                return results
+    // Если хостов немного, проверяем последовательно для лучшей диагностики
+    if len(hosts) <= 3 {
+        for _, host := range hosts {
+            results[host.Name] = checkSSHConnectionAdvanced(host, workDir)
         }
+        return results
+    }
 
-        // Для большего количества хостов - параллельно
-        resultChan := make(chan struct {
+    // Для большего количества хостов - параллельно
+    resultChan := make(chan struct {
+        name   string
+        result bool
+    }, len(hosts))
+
+    // Максимум 3 параллельных проверки, чтобы не перегружать сеть
+    semaphore := make(chan struct{}, 3)
+
+    for _, host := range hosts {
+        go func(h HostConfig) {
+            semaphore <- struct{}{}
+            defer func() { <-semaphore }()
+
+            result := checkSSHConnectionAdvanced(h, workDir)
+            resultChan <- struct {
                 name   string
                 result bool
-        }, len(hosts))
+            }{h.Name, result}
+        }(host)
+    }
 
-        // Максимум 3 параллельных проверки, чтобы не перегружать сеть
-        semaphore := make(chan struct{}, 3)
+    // Собираем результаты
+    for i := 0; i < len(hosts); i++ {
+        res := <-resultChan
+        results[res.name] = res.result
+    }
 
-        for _, host := range hosts {
-                go func(h HostConfig) {
-                        semaphore <- struct{}{}
-                        defer func() { <-semaphore }()
-
-                        result := checkSSHConnectionAdvanced(h, workDir)
-                        resultChan <- struct {
-                                name   string
-                                result bool
-                        }{h.Name, result}
-                }(host)
-        }
-
-        // Собираем результаты
-        for i := 0; i < len(hosts); i++ {
-                res := <-resultChan
-                results[res.name] = res.result
-        }
-
-        return results
+    return results
 }
 
 // findFastestAvailableHost находит самый быстрый доступный хост из списка
 func findFastestAvailableHost(hosts []HostConfig, workDir string) (*HostConfig, time.Duration) {
-        debugLog("CHECKER", "Finding fastest among %d hosts", len(hosts))
-        if len(hosts) == 0 {
-                return nil, 0
+    debugLog("CHECKER", "Finding fastest among %d hosts", len(hosts))
+    if len(hosts) == 0 {
+        return nil, 0
+    }
+
+    type hostResult struct {
+        host         HostConfig
+        available    bool
+        responseTime time.Duration
+    }
+
+    results := make(chan hostResult, len(hosts))
+    semaphore := make(chan struct{}, 3) // Максимум 3 параллельных проверки
+
+    for _, host := range hosts {
+        go func(h HostConfig) {
+            semaphore <- struct{}{}
+            defer func() { <-semaphore }()
+
+            available, responseTime := checkSSHConnectionWithTimeFn(h, workDir)
+            results <- hostResult{
+                host:         h,
+                available:    available,
+                responseTime: responseTime,
+            }
+        }(host)
+    }
+
+    // Собираем результаты
+    var fastestHost *HostConfig
+    var fastestTime time.Duration = 24 * time.Hour // Очень большое время
+
+    for i := 0; i < len(hosts); i++ {
+        result := <-results
+        if result.available {
+            if result.responseTime < fastestTime {
+                fastestTime = result.responseTime
+                fastestHost = &result.host
+            }
         }
+    }
 
-        type hostResult struct {
-                host         HostConfig
-                available    bool
-                responseTime time.Duration
-        }
-
-        results := make(chan hostResult, len(hosts))
-        semaphore := make(chan struct{}, 3) // Максимум 3 параллельных проверки
-
-        for _, host := range hosts {
-                go func(h HostConfig) {
-                        semaphore <- struct{}{}
-                        defer func() { <-semaphore }()
-
-                        available, responseTime := checkSSHConnectionWithTimeFn(h, workDir)
-                        results <- hostResult{
-                                host:         h,
-                                available:    available,
-                                responseTime: responseTime,
-                        }
-                }(host)
-        }
-
-        // Собираем результаты
-        var fastestHost *HostConfig
-        var fastestTime time.Duration = 24 * time.Hour // Очень большое время
-
-        for i := 0; i < len(hosts); i++ {
-                result := <-results
-                if result.available {
-                        if result.responseTime < fastestTime {
-                                fastestTime = result.responseTime
-                                fastestHost = &result.host
-                        }
-                }
-        }
-
-        return fastestHost, fastestTime
+    return fastestHost, fastestTime
 }
 
 // checkHostsAvailabilityWithTime проверяет доступность хостов с измерением времени
 func checkHostsAvailabilityWithTime(hosts []HostConfig, workDir string) map[string]HostStatusWithTime {
-        result := make(map[string]HostStatusWithTime)
+    result := make(map[string]HostStatusWithTime)
 
-        if len(hosts) == 0 {
-                return result
-        }
-
-        type hostCheckResult struct {
-                name   string
-                status HostStatusWithTime
-        }
-
-        results := make(chan hostCheckResult, len(hosts))
-        semaphore := make(chan struct{}, 3) // Максимум 3 параллельных проверки
-
-        for _, host := range hosts {
-                go func(h HostConfig) {
-                        semaphore <- struct{}{}
-                        defer func() { <-semaphore }()
-
-                        available, responseTime := checkSSHConnectionWithTimeFn(h, workDir)
-
-                        results <- hostCheckResult{
-                                name: h.Name,
-                                status: HostStatusWithTime{
-                                        Host:         h,
-                                        Available:    available,
-                                        ResponseTime: responseTime,
-                                        LastCheck:    time.Now(),
-                                },
-                        }
-                }(host)
-        }
-
-        // Собираем результаты
-        for i := 0; i < len(hosts); i++ {
-                res := <-results
-                result[res.name] = res.status
-        }
-
+    if len(hosts) == 0 {
         return result
+    }
+
+    type hostCheckResult struct {
+        name   string
+        status HostStatusWithTime
+    }
+
+    results := make(chan hostCheckResult, len(hosts))
+    semaphore := make(chan struct{}, 3) // Максимум 3 параллельных проверки
+
+    for _, host := range hosts {
+        go func(h HostConfig) {
+            semaphore <- struct{}{}
+            defer func() { <-semaphore }()
+
+            available, responseTime := checkSSHConnectionWithTimeFn(h, workDir)
+
+            results <- hostCheckResult{
+                name: h.Name,
+                status: HostStatusWithTime{
+                    Host:         h,
+                    Available:    available,
+                    ResponseTime: responseTime,
+                    LastCheck:    time.Now(),
+                },
+            }
+        }(host)
+    }
+
+    // Собираем результаты
+    for i := 0; i < len(hosts); i++ {
+        res := <-results
+        result[res.name] = res.status
+    }
+
+    return result
 }
