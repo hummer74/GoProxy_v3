@@ -8,6 +8,7 @@ package main
 import (
         "fmt"
         "strings"
+        "sync/atomic"
         "time"
 )
 
@@ -53,6 +54,10 @@ type ConnectOptions struct {
 //
 // Returns the ProxyState on success, nil on failure.
 func establishConnection(opts ConnectOptions) *ProxyState {
+        // Clear the user-stop flag: any new connection attempt (user click,
+        // failover, recovery) cancels a previous "Stop Proxy" request.
+        atomic.StoreUint64(&userStopRequested, 0)
+
         // Invalidate any previous connection attempts (cancel zombie retry loops)
         gen := nextTunnelGeneration()
         debugLog("PIPELINE", "establishConnection: %d hosts, isChain=%v, gen=%d", len(opts.Hosts), opts.IsChain, gen)

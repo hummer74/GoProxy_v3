@@ -6,6 +6,7 @@ import (
         "os"
         "os/exec"
         "strings"
+        "sync/atomic"
         "time"
 
         "github.com/getlantern/systray"
@@ -368,12 +369,18 @@ func handleKillProxy() {
         debugLog("HANDLER", "Kill proxy")
         logTunnelEvent("INFO", connState.GetHost(), "User requested to kill proxy")
 
+        // Set stop flag BEFORE any other action so that the monitoring goroutine
+        // picks it up on its next tick, even if stopMonitoring() doesn't reach it
+        // in time (race condition fix).
+        atomic.StoreUint64(&userStopRequested, 1)
+
         // Invalidate any running connection attempts (cancel zombie retry loops)
         nextTunnelGeneration()
 
         stopMonitoring()
         disableSystemProxy()
         killProcessByFile(Config.TempFiles.SSHTunnelPID, "SSH Tunnel")
+        stopPACServer()
 
         iconData := loadIconData(color.RGBA{255, 0, 0, 255})
         if iconData != nil {

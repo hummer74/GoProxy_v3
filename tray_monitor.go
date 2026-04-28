@@ -7,6 +7,7 @@ import (
         "net/http"
         "os"
         "strings"
+        "sync/atomic"
         "time"
 
         "github.com/getlantern/systray"
@@ -569,7 +570,7 @@ func (mc *monitoringConfig) handleRecoveryState(state *ProxyState) bool {
 
                 if allOk {
                         logTunnelEvent("INFO", state.Host,
-                                fmt.Sprintf("All original chain hosts are reachable, attempting chain restoration"))
+                                "All original chain hosts are reachable, attempting chain restoration")
                         if attemptChainRecovery(origState) {
                                 // Chain restored — transition to Normal
                                 mc.failState = StateNormal
@@ -698,7 +699,7 @@ func (mc *monitoringConfig) handleNoInternetState(state *ProxyState) {
         // Check timeout (24 hours)
         if elapsed >= mc.noInternetMax {
                 logTunnelEvent("ERROR", state.Host,
-                        fmt.Sprintf("NoInternet: 24h wait expired — entering Error/Halt"))
+                        "NoInternet: 24h wait expired — entering Error/Halt")
                 mc.failState = StateErrorHalt
                 connState.SetFailState(StateErrorHalt)
 
@@ -859,6 +860,12 @@ func startMonitoring(state *ProxyState) {
                         return
 
                 case <-ticker.C:
+                        // Check user-initiated stop (handleKillProxy sets this flag)
+                        if atomic.LoadUint64(&userStopRequested) != 0 {
+                                logTunnelEvent("INFO", state.Host, "User stop requested, monitoring exiting")
+                                return
+                        }
+
                         // Check stop-flag file (written by -stop mode)
                         if _, err := os.Stat(Config.TempFiles.StopFlag); err == nil {
                                 logTunnelEvent("INFO", state.Host, "Stop flag detected, monitoring stopped")

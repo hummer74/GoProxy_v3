@@ -20,6 +20,12 @@ var (
     monitoringStopChan chan bool
     menuUpdateTicker   *time.Ticker
     hostsCheckTicker   *time.Ticker // Ticker for periodic hosts checking
+
+    // userStopRequested is set to 1 when the user clicks "Stop Proxy".
+    // The monitoring goroutine checks this flag on every tick to prevent
+    // race conditions where handleKillProxy() and the monitoring loop
+    // execute concurrently, causing an unwanted reconnection.
+    userStopRequested uint64
 )
 
 // runTrayMode runs the system tray application
