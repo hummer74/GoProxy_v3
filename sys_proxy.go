@@ -99,6 +99,15 @@ func startPACServerInternal() {
                 fileServer.ServeHTTP(w, r)
         })
 
+        // /healthz — статус туннеля/SOCKS/PAC (по анкете)
+        mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+                host, active, _, failState := connState.GetAll()
+                socks := checkSocks5(Config.Network.ProxyPort)
+                w.Header().Set("Content-Type", "application/json")
+                fmt.Fprintf(w, `{"host":%q,"active":%v,"socks":%v,"fail_state":%q,"pac_port":%d,"proxy_port":%d}`,
+                        host, active, socks, failState.String(), Config.Network.PACHttpPort, Config.Network.ProxyPort)
+        })
+
         server := &http.Server{
                 Addr:    fmt.Sprintf("127.0.0.1:%d", Config.Network.PACHttpPort),
                 Handler: mux,

@@ -7,26 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	windows "golang.org/x/sys/windows"
 )
 
-// tunnelGeneration is incremented every time a new connection is initiated
-// or an existing tunnel is killed. Long-running retry loops check this value
-// before each retry to detect cancellation.
-var tunnelGeneration uint64
-
-// nextTunnelGeneration atomically increments and returns the new generation.
-func nextTunnelGeneration() uint64 {
-	return atomic.AddUint64(&tunnelGeneration, 1)
-}
-
-// currentTunnelGeneration returns the current generation (for comparison).
-func currentTunnelGeneration() uint64 {
-	return atomic.LoadUint64(&tunnelGeneration)
-}
+// Generation checks below go directly through connMgr.generation() —
+// the single source of truth for connection sessions (see conn_manager.go).
 
 // testTunnelConnectivity starts a temporary SSH tunnel on testPort (NOT the
 // production port) to verify that a full SOCKS5 tunnel can be established.
@@ -42,7 +29,7 @@ func currentTunnelGeneration() uint64 {
 // The caller should call this BEFORE establishConnection to guarantee that
 // killing the old production tunnel is safe.
 func testTunnelConnectivity(sshCmd []string, testPort int, timeout time.Duration) bool {
-	myGen := currentTunnelGeneration()
+	myGen := connMgr.generation()
 	testCmd := replaceSSHTunnelPort(sshCmd, testPort)
 	host := extractHostFromSSHCommand(testCmd)
 
@@ -101,8 +88,8 @@ func testTunnelConnectivity(sshCmd []string, testPort int, timeout time.Duration
 
 		case <-ticker.C:
 			// Check if this test has been superseded by a new connection
-			if currentTunnelGeneration() != myGen {
-				debugLog("TUNNEL", "TEST: generation changed (%d → %d), aborting test", myGen, currentTunnelGeneration())
+			if connMgr.generation() != myGen {
+				debugLog("TUNNEL", "TEST: generation changed (%d → %d), aborting test", myGen, connMgr.generation())
 				return false
 			}
 
@@ -133,19 +120,19 @@ func startSSHTunnel(sshCmd []string) bool {
 }
 
 // startSSHTunnelWithRetries attempts to start SSH tunnel with progressive timeouts based on chain length.
-// Checks tunnelGeneration before each retry — if a new connection was initiated or the
+// Checks connMgr.generation() before each retry — if a new connection was initiated or the
 // tunnel was killed, the retry loop is aborted immediately.
 func startSSHTunnelWithRetries(sshCmd []string, chainLength int) bool {
-	myGen := currentTunnelGeneration()
+	myGen := connMgr.generation()
 	debugLog("TUNNEL", "Starting tunnel with %d retries, chain length %d, gen=%d", 3, chainLength, myGen)
 
 	// Base timeout: 15 seconds per hop, but at least 15s and at most 90s
 	baseTimeout := 15 * time.Duration(chainLength) * time.Second
 	if baseTimeout < 15*time.Second {
-		baseTimeout = 15*time.Second
+		baseTimeout = 15 * time.Second
 	}
 	if baseTimeout > 90*time.Second {
-		baseTimeout = 90*time.Second
+		baseTimeout = 90 * time.Second
 	}
 
 	// Progressive timeouts: first = base, second = base*1.5, third = base*2
@@ -157,8 +144,8 @@ func startSSHTunnelWithRetries(sshCmd []string, chainLength int) bool {
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		// Check if this connection attempt has been superseded
-		if currentTunnelGeneration() != myGen {
-			debugLog("TUNNEL", "Generation changed (%d → %d), aborting retries", myGen, currentTunnelGeneration())
+		if connMgr.generation() != myGen {
+			debugLog("TUNNEL", "Generation changed (%d → %d), aborting retries", myGen, connMgr.generation())
 			return false
 		}
 
@@ -173,7 +160,7 @@ func startSSHTunnelWithRetries(sshCmd []string, chainLength int) bool {
 		}
 
 		// Re-check generation after timeout (process was killed or timed out)
-		if currentTunnelGeneration() != myGen {
+		if connMgr.generation() != myGen {
 			debugLog("TUNNEL", "Generation changed after attempt %d, aborting retries", attempt)
 			return false
 		}
@@ -324,7 +311,7 @@ func startSSHTunnelWithTimeout(sshCmd []string, timeout time.Duration, gen uint6
 		case err := <-done:
 			// Process exited
 			// Check if killed by a newer generation
-			if currentTunnelGeneration() != gen {
+			if connMgr.generation() != gen {
 				debugLog("TUNNEL", "SSH process killed by generation change, aborting")
 				os.Remove(Config.TempFiles.SSHTunnelPID)
 				return false
@@ -346,7 +333,7 @@ func startSSHTunnelWithTimeout(sshCmd []string, timeout time.Duration, gen uint6
 
 		case <-timeoutCh:
 			// Check if superseded before logging timeout
-			if currentTunnelGeneration() != gen {
+			if connMgr.generation() != gen {
 				debugLog("TUNNEL", "Timeout superseded by generation change, aborting")
 				if cmd.Process != nil {
 					killPid(cmd.Process.Pid)
@@ -371,7 +358,7 @@ func startSSHTunnelWithTimeout(sshCmd []string, timeout time.Duration, gen uint6
 
 		case <-ticker.C:
 			// Check if superseded
-			if currentTunnelGeneration() != gen {
+			if connMgr.generation() != gen {
 				debugLog("TUNNEL", "Generation changed during poll, aborting tunnel start")
 				if cmd.Process != nil {
 					killPid(cmd.Process.Pid)

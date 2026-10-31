@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// SaveState saves the current proxy state to disk
+// SaveState saves the current proxy state to disk atomically (tmp+rename).
 func SaveState(state ProxyState) error {
 	debugLog("STATE", "Saving state: %s -> is_chain=%v", state.Host, state.IsChain)
 	data, err := json.MarshalIndent(state, "", "  ")
@@ -17,8 +17,13 @@ func SaveState(state ProxyState) error {
 		return fmt.Errorf("failed to marshal state: %v", err)
 	}
 
-	if err := os.WriteFile(Config.TempFiles.StateFile, data, 0644); err != nil {
-		return fmt.Errorf("failed to write state file: %v", err)
+	tmp := Config.TempFiles.StateFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return fmt.Errorf("failed to write state tmp file: %v", err)
+	}
+	if err := os.Rename(tmp, Config.TempFiles.StateFile); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("failed to rename state file: %v", err)
 	}
 
 	return nil
@@ -40,11 +45,20 @@ func LoadState() (*ProxyState, error) {
 	return &state, nil
 }
 
-// SaveLastHost saves the last connected host for auto-connect
+// SaveLastHost saves the last USER-CHOSEN host for auto-connect.
+// Вызывается только при реальном выборе пользователя (клик/цепочка/возврат
+// к оригиналу). Failover и автофолбэки передают SaveLastHost:false и файл
+// не трогают — приоритет не затирается.
 func SaveLastHost(hostName string) error {
 	debugLog("STATE", "Saving last host: %s", hostName)
 	if err := os.WriteFile(Config.Paths.LastHostFile, []byte(hostName), 0644); err != nil {
 		return fmt.Errorf("failed to write last host file: %v", err)
+	}
+	// Синхронизируем in-memory приоритет с файлом (раньше priorityHost
+	// загружался раз при старте и дрейфовал от файла после каждого клика).
+	if hostName != "" {
+		priorityHost = hostName
+		hasPriorityHost = true
 	}
 	return nil
 }
@@ -110,6 +124,14 @@ func runStopMode() {
 	// 4. Wait and force stop tray
 	time.Sleep(2 * time.Second)
 	killProcessByFile(Config.TempFiles.TrayPID, "Tray Monitor (Force)")
+
+	// 4b. Purge agent keys and stop the service (the old stop bat did
+	// ssh-add -d + taskkill ssh-agent.exe outside the exe).
+	cleanupSSHAgent()
+
+	// 4c. Legacy known_hosts from pre-nul versions (unused since
+	// UserKnownHostsFile=nul, but old sessions may leave it behind).
+	os.Remove(filepath.Join(Config.Paths.WorkDir, ".ssh", "goproxy_known_hosts"))
 
 	// 5. Clean up temp files
 	files := []string{

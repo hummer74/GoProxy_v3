@@ -4,10 +4,10 @@
 package main
 
 import (
-        "encoding/json"
-        "os"
-        "path/filepath"
-        "testing"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
 )
 
 // ---------------------------------------------------------------------------
@@ -15,48 +15,48 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestResolveSSHKeyPath_AbsolutePath(t *testing.T) {
-        // Absolute paths should be returned as-is, regardless of workdir.
-        // Use a guaranteed-absolute directory (TempDir is always absolute).
-        tmpDir := t.TempDir()
-        absKey := filepath.Join(tmpDir, "home", "user", ".ssh", "id_key")
+	// Absolute paths should be returned as-is, regardless of workdir.
+	// Use a guaranteed-absolute directory (TempDir is always absolute).
+	tmpDir := t.TempDir()
+	absKey := filepath.Join(tmpDir, "home", "user", ".ssh", "id_key")
 
-        result := resolveSSHKeyPath(tmpDir, absKey)
-        if result != absKey {
-                t.Errorf("absolute path = %q, want %q", result, absKey)
-        }
+	result := resolveSSHKeyPath(tmpDir, absKey)
+	if result != absKey {
+		t.Errorf("absolute path = %q, want %q", result, absKey)
+	}
 }
 
 func TestResolveSSHKeyPath_EmptyKey(t *testing.T) {
-        result := resolveSSHKeyPath("/workdir", "")
-        if result != "" {
-                t.Errorf("empty key = %q, want empty", result)
-        }
+	result := resolveSSHKeyPath("/workdir", "")
+	if result != "" {
+		t.Errorf("empty key = %q, want empty", result)
+	}
 }
 
 func TestResolveSSHKeyPath_RelativeInDotSSH(t *testing.T) {
-        tmpDir := t.TempDir()
-        sshDir := filepath.Join(tmpDir, ".ssh")
-        os.MkdirAll(sshDir, 0755)
+	tmpDir := t.TempDir()
+	sshDir := filepath.Join(tmpDir, ".ssh")
+	os.MkdirAll(sshDir, 0755)
 
-        keyFile := filepath.Join(sshDir, "id_custom")
-        os.WriteFile(keyFile, []byte("key-data"), 0600)
+	keyFile := filepath.Join(sshDir, "id_custom")
+	os.WriteFile(keyFile, []byte("key-data"), 0600)
 
-        result := resolveSSHKeyPath(tmpDir, "id_custom")
-        if result != keyFile {
-                t.Errorf("relative key in .ssh = %q, want %q", result, keyFile)
-        }
+	result := resolveSSHKeyPath(tmpDir, "id_custom")
+	if result != keyFile {
+		t.Errorf("relative key in .ssh = %q, want %q", result, keyFile)
+	}
 }
 
 func TestResolveSSHKeyPath_RelativeNoDotSSH(t *testing.T) {
-        tmpDir := t.TempDir()
+	tmpDir := t.TempDir()
 
-        keyFile := filepath.Join(tmpDir, "id_direct")
-        os.WriteFile(keyFile, []byte("key-data"), 0600)
+	keyFile := filepath.Join(tmpDir, "id_direct")
+	os.WriteFile(keyFile, []byte("key-data"), 0600)
 
-        result := resolveSSHKeyPath(tmpDir, "id_direct")
-        if result != keyFile {
-                t.Errorf("relative key (no .ssh) = %q, want %q", result, keyFile)
-        }
+	result := resolveSSHKeyPath(tmpDir, "id_direct")
+	if result != keyFile {
+		t.Errorf("relative key (no .ssh) = %q, want %q", result, keyFile)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -64,27 +64,27 @@ func TestResolveSSHKeyPath_RelativeNoDotSSH(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSavePid_WritesValidJSON(t *testing.T) {
-        tmpDir := t.TempDir()
-        pidFile := filepath.Join(tmpDir, "test.pid")
+	tmpDir := t.TempDir()
+	pidFile := filepath.Join(tmpDir, "test.pid")
 
-        savePid(pidFile, 12345, "SSH Tunnel")
+	savePid(pidFile, 12345, "SSH Tunnel")
 
-        data, err := os.ReadFile(pidFile)
-        if err != nil {
-                t.Fatalf("read pid file: %v", err)
-        }
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read pid file: %v", err)
+	}
 
-        var pd PidData
-        if err := json.Unmarshal(data, &pd); err != nil {
-                t.Fatalf("unmarshal pid data: %v", err)
-        }
+	var pd PidData
+	if err := json.Unmarshal(data, &pd); err != nil {
+		t.Fatalf("unmarshal pid data: %v", err)
+	}
 
-        if pd.Pid != 12345 {
-                t.Errorf("Pid = %d, want 12345", pd.Pid)
-        }
-        if pd.Info != "SSH Tunnel" {
-                t.Errorf("Info = %q, want %q", pd.Info, "SSH Tunnel")
-        }
+	if pd.Pid != 12345 {
+		t.Errorf("Pid = %d, want 12345", pd.Pid)
+	}
+	if pd.Info != "SSH Tunnel" {
+		t.Errorf("Info = %q, want %q", pd.Info, "SSH Tunnel")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -92,24 +92,24 @@ func TestSavePid_WritesValidJSON(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGetCircledNumber(t *testing.T) {
-        tests := []struct {
-                pos  int
-                want string
-        }{
-                {1, "①"},
-                {2, "②"},
-                {5, "⑤"},
-                {10, "⑩"},
-                {0, "?"},
-                {11, "?"},
-                {-1, "?"},
-        }
-        for _, tt := range tests {
-                got := GetCircledNumber(tt.pos)
-                if got != tt.want {
-                        t.Errorf("GetCircledNumber(%d) = %q, want %q", tt.pos, got, tt.want)
-                }
-        }
+	tests := []struct {
+		pos  int
+		want string
+	}{
+		{1, "①"},
+		{2, "②"},
+		{5, "⑤"},
+		{10, "⑩"},
+		{0, "?"},
+		{11, "?"},
+		{-1, "?"},
+	}
+	for _, tt := range tests {
+		got := GetCircledNumber(tt.pos)
+		if got != tt.want {
+			t.Errorf("GetCircledNumber(%d) = %q, want %q", tt.pos, got, tt.want)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -117,28 +117,28 @@ func TestGetCircledNumber(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPriorityHost_ClearAndLoad(t *testing.T) {
-        // Clear first
-        ClearPriorityHost()
-        if priorityHost != "" {
-                t.Errorf("priorityHost after clear = %q, want empty", priorityHost)
-        }
-        if hasPriorityHost {
-                t.Error("hasPriorityHost should be false after clear")
-        }
+	// Clear first
+	ClearPriorityHost()
+	if priorityHost != "" {
+		t.Errorf("priorityHost after clear = %q, want empty", priorityHost)
+	}
+	if hasPriorityHost {
+		t.Error("hasPriorityHost should be false after clear")
+	}
 
-        // Set directly (simulating LoadPriorityHost behavior)
-        priorityHost = "my-priority-host"
-        hasPriorityHost = true
+	// Set directly (simulating LoadPriorityHost behavior)
+	priorityHost = "my-priority-host"
+	hasPriorityHost = true
 
-        if GetPriorityHost() != "my-priority-host" {
-                t.Errorf("GetPriorityHost() = %q, want %q", GetPriorityHost(), "my-priority-host")
-        }
-        if !HasPriorityHost() {
-                t.Error("HasPriorityHost() should be true")
-        }
+	if GetPriorityHost() != "my-priority-host" {
+		t.Errorf("GetPriorityHost() = %q, want %q", GetPriorityHost(), "my-priority-host")
+	}
+	if !HasPriorityHost() {
+		t.Error("HasPriorityHost() should be true")
+	}
 
-        // Clean up
-        ClearPriorityHost()
+	// Clean up
+	ClearPriorityHost()
 }
 
 // ---------------------------------------------------------------------------
@@ -146,55 +146,55 @@ func TestPriorityHost_ClearAndLoad(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLoadPriorityHost_FromFile(t *testing.T) {
-        tmpDir := t.TempDir()
-        priorityPath := filepath.Join(tmpDir, ".ssh", "x_lasthost.cfg")
-        os.MkdirAll(filepath.Join(tmpDir, ".ssh"), 0755)
-        os.WriteFile(priorityPath, []byte("  my-priority  \n"), 0644)
+	tmpDir := t.TempDir()
+	priorityPath := filepath.Join(tmpDir, ".ssh", "x_lasthost.cfg")
+	os.MkdirAll(filepath.Join(tmpDir, ".ssh"), 0755)
+	os.WriteFile(priorityPath, []byte("  my-priority  \n"), 0644)
 
-        // Setup config
-        Config = &AppConfig{}
-        Config.Paths.WorkDir = tmpDir
+	// Setup config
+	Config = &AppConfig{}
+	Config.Paths.WorkDir = tmpDir
 
-        // Clear first
-        ClearPriorityHost()
+	// Clear first
+	ClearPriorityHost()
 
-        result := LoadPriorityHost()
-        if result != "my-priority" {
-                t.Errorf("LoadPriorityHost() = %q, want %q (trimmed)", result, "my-priority")
-        }
-        if !HasPriorityHost() {
-                t.Error("HasPriorityHost() should be true after load")
-        }
+	result := LoadPriorityHost()
+	if result != "my-priority" {
+		t.Errorf("LoadPriorityHost() = %q, want %q (trimmed)", result, "my-priority")
+	}
+	if !HasPriorityHost() {
+		t.Error("HasPriorityHost() should be true after load")
+	}
 }
 
 func TestLoadPriorityHost_NoFile(t *testing.T) {
-        Config = &AppConfig{}
-        Config.Paths.WorkDir = "/nonexistent"
+	Config = &AppConfig{}
+	Config.Paths.WorkDir = "/nonexistent"
 
-        ClearPriorityHost()
-        result := LoadPriorityHost()
-        if result != "" {
-                t.Errorf("LoadPriorityHost() = %q, want empty (no file)", result)
-        }
-        if HasPriorityHost() {
-                t.Error("HasPriorityHost() should be false when no file")
-        }
+	ClearPriorityHost()
+	result := LoadPriorityHost()
+	if result != "" {
+		t.Errorf("LoadPriorityHost() = %q, want empty (no file)", result)
+	}
+	if HasPriorityHost() {
+		t.Error("HasPriorityHost() should be false when no file")
+	}
 }
 
 func TestLoadPriorityHost_EmptyFile(t *testing.T) {
-        tmpDir := t.TempDir()
-        priorityPath := filepath.Join(tmpDir, ".ssh", "x_lasthost.cfg")
-        os.MkdirAll(filepath.Join(tmpDir, ".ssh"), 0755)
-        os.WriteFile(priorityPath, []byte("   \n"), 0644)
+	tmpDir := t.TempDir()
+	priorityPath := filepath.Join(tmpDir, ".ssh", "x_lasthost.cfg")
+	os.MkdirAll(filepath.Join(tmpDir, ".ssh"), 0755)
+	os.WriteFile(priorityPath, []byte("   \n"), 0644)
 
-        Config = &AppConfig{}
-        Config.Paths.WorkDir = tmpDir
+	Config = &AppConfig{}
+	Config.Paths.WorkDir = tmpDir
 
-        ClearPriorityHost()
-        result := LoadPriorityHost()
-        if result != "" {
-                t.Errorf("LoadPriorityHost() = %q, want empty (whitespace only)", result)
-        }
+	ClearPriorityHost()
+	result := LoadPriorityHost()
+	if result != "" {
+		t.Errorf("LoadPriorityHost() = %q, want empty (whitespace only)", result)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -202,24 +202,24 @@ func TestLoadPriorityHost_EmptyFile(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPidData_JSONRoundTrip(t *testing.T) {
-        original := PidData{Pid: 9999, Info: "Test Process"}
+	original := PidData{Pid: 9999, Info: "Test Process"}
 
-        data, err := json.Marshal(original)
-        if err != nil {
-                t.Fatalf("Marshal: %v", err)
-        }
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
 
-        var restored PidData
-        if err := json.Unmarshal(data, &restored); err != nil {
-                t.Fatalf("Unmarshal: %v", err)
-        }
+	var restored PidData
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
 
-        if restored.Pid != original.Pid {
-                t.Errorf("Pid = %d, want %d", restored.Pid, original.Pid)
-        }
-        if restored.Info != original.Info {
-                t.Errorf("Info = %q, want %q", restored.Info, original.Info)
-        }
+	if restored.Pid != original.Pid {
+		t.Errorf("Pid = %d, want %d", restored.Pid, original.Pid)
+	}
+	if restored.Info != original.Info {
+		t.Errorf("Info = %q, want %q", restored.Info, original.Info)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -227,20 +227,65 @@ func TestPidData_JSONRoundTrip(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHostStatusWithTime_Fields(t *testing.T) {
-        host := HostConfig{Name: "test", HostName: "1.2.3.4"}
-        status := HostStatusWithTime{
-                Host:         host,
-                Available:    true,
-                ResponseTime: 1500000000, // 1.5s in nanoseconds
-        }
+	host := HostConfig{Name: "test", HostName: "1.2.3.4"}
+	status := HostStatusWithTime{
+		Host:         host,
+		Available:    true,
+		ResponseTime: 1500000000, // 1.5s in nanoseconds
+	}
 
-        if !status.Available {
-                t.Error("Available should be true")
-        }
-        if status.Host.Name != "test" {
-                t.Errorf("Host.Name = %q, want %q", status.Host.Name, "test")
-        }
-        if status.ResponseTime <= 0 {
-                t.Error("ResponseTime should be positive")
-        }
+	if !status.Available {
+		t.Error("Available should be true")
+	}
+	if status.Host.Name != "test" {
+		t.Errorf("Host.Name = %q, want %q", status.Host.Name, "test")
+	}
+	if status.ResponseTime <= 0 {
+		t.Error("ResponseTime should be positive")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// checkPidAlive — exact PID match (P2: substring matching caused false
+// "alive" hits, e.g. PID 123 matching a 1234 row, which spammed
+// "Cannot kill PID (run elevated?)" for already-dead probe processes).
+// ---------------------------------------------------------------------------
+
+func TestCheckPidAlive_OwnProcess(t *testing.T) {
+	if !checkPidAlive(os.Getpid()) {
+		t.Errorf("checkPidAlive(own pid %d) = false, want true", os.Getpid())
+	}
+}
+
+func TestCheckPidAlive_BogusPid(t *testing.T) {
+	// PID 999999 cannot exist on Windows (max 2^22); even as a substring
+	// it must not match any tasklist row.
+	if checkPidAlive(999999) {
+		t.Error("checkPidAlive(999999) = true, want false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Elevation helpers (main.go). ensureElevated/shellExecuteRunAs are NOT
+// tested: relaunching or exiting the test process is out of the question.
+// isElevated and quoteArg are pure and safe.
+// ---------------------------------------------------------------------------
+
+func TestIsElevated_Consistent(t *testing.T) {
+	// Must not crash and must be deterministic within one process.
+	if isElevated() != isElevated() {
+		t.Error("isElevated() is not consistent within one process")
+	}
+}
+
+func TestQuoteArg(t *testing.T) {
+	if got := quoteArg("-log"); got != "-log" {
+		t.Errorf("plain = %q, want unchanged", got)
+	}
+	if got := quoteArg("a b"); got != `"a b"` {
+		t.Errorf("spaced = %q, want quoted", got)
+	}
+	if got := quoteArg(`a"b`); got != `"a""b"` {
+		t.Errorf("quoted = %q, want doubled quotes", got)
+	}
 }

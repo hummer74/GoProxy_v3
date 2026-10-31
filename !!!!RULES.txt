@@ -1,0 +1,14 @@
+
+Внимательно изучи предоставленные файлы. Целевая система Windows и только Windows. Никакой кроссплатформенности не надо, но под Windows должно работать очень надёжно!
+
+Все разговоры и рассуждения в чате на русском языке. 
+Весь код, комментарии к нему и вывод в консоль или в GUI - на английском языке. 
+
+
+
+Это просто полезные штучки:
+type id_just_proxy | ssh-add - | type key_pass
+go build -ldflags="-s -w -linkmode=external -extldflags=-static" -o GoProxy.exe .
+upx --ultra-brute GoProxy.exe
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+

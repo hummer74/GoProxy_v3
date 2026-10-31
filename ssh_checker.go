@@ -21,9 +21,24 @@ func checkSSHConnectionAdvanced(host HostConfig, workDir string) bool {
     return result
 }
 
-// checkSSHConnectionWithTime проверяет SSH соединение и возвращает время отклика
+// checkSSHConnectionWithTime: комбо TCP-пинг 22 + ssh exit 0 (по анкете).
 // Возвращает true и время отклика, если хост доступен
 func checkSSHConnectionWithTime(host HostConfig, workDir string) (bool, time.Duration) {
+    // Fast pre-check: TCP на 22 порт за 3с. Если закрыт — не спавним ssh.exe.
+    port := host.Port
+    if port == "" {
+        port = "22"
+    }
+    var tcpElapsed time.Duration
+    if !shouldSkipPrecheck(host) {
+        tcpStart := time.Now()
+        if !tcpPortOpen(host.HostName, port, 3*time.Second) {
+            debugLog("CHECKER", "TCP pre-check failed for %s (%s:%s)", host.Name, host.HostName, port)
+            return false, 0
+        }
+        tcpElapsed = time.Since(tcpStart)
+    }
+
     testCmd := buildTestSSHCommand(host, workDir)
 
     if len(testCmd) == 0 {
@@ -59,7 +74,7 @@ func checkSSHConnectionWithTime(host HostConfig, workDir string) (bool, time.Dur
 
     select {
     case err := <-done:
-        responseTime := time.Since(startTime)
+        responseTime := time.Since(startTime) + tcpElapsed
 
         if err != nil {
             // Команда завершилась с ошибкой
@@ -106,10 +121,18 @@ func checkSSHConnectionWithTime(host HostConfig, workDir string) (bool, time.Dur
     }
 }
 
+// shouldSkipPrecheck reports whether the fast TCP pre-check must be skipped for this host.
+// Direct TCP dial does not go through ProxyJump or ssh_config aliases, so it would give false negatives.
+func shouldSkipPrecheck(host HostConfig) bool { return host.ProxyJump != "" }
+
 // buildTestSSHCommand строит тестовую SSH команду для проверки соединения
 func buildTestSSHCommand(host HostConfig, workDir string) []string {
     cmd := []string{"ssh"}
 
+    connectTimeout := Config.General.FailoverResponseTime
+    if connectTimeout <= 0 {
+        connectTimeout = 5
+    }
     // Опции для проверки - такие же как в реальном подключении, но с более короткими таймаутами
     cmd = append(cmd,
         "-o", "AddressFamily=inet",
@@ -118,7 +141,7 @@ func buildTestSSHCommand(host HostConfig, workDir string) []string {
         "-o", "ControlPath=none", // Disable ControlPath lookup: stale sockets from previous sessions cause "getsockname failed" even with ControlMaster=no
         "-o", "TCPKeepAlive=no",
         "-o", "ControlPersist=no",
-        "-o", fmt.Sprintf("ConnectTimeout=%d", Config.General.FailoverResponseTime), // Таймаут подключения из конфига
+        "-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeout), // Таймаут подключения из конфига
         "-o", "ServerAliveInterval=5", // Проверка активности
         "-o", "ServerAliveCountMax=2", // Быстро отключаться если нет ответа
         "-o", "StrictHostKeyChecking=no",
@@ -167,29 +190,39 @@ func buildTestSSHCommand(host HostConfig, workDir string) []string {
     return cmd
 }
 
-// checkSSHConnectionBatch проверяет несколько хостов параллельно
-func checkSSHConnectionBatch(hosts []HostConfig, workDir string) map[string]bool {
+// checkSSHConnectionBatch проверяет хосты всегда параллельно (пул 6).
+// Последовательная ветка для ≤3 хостов убрана: именно она давала ~8с на
+// проверку цепочки из 3 хопов вместо ~3с параллельно.
+func checkSSHConnectionBatch(hosts []HostConfig, workDir string) (map[string]bool, []string) {
     debugLog("CHECKER", "Checking %d hosts (batch)", len(hosts))
     results := make(map[string]bool)
-
-    // Если хостов немного, проверяем последовательно для лучшей диагностики
-    if len(hosts) <= 3 {
-        for _, host := range hosts {
-            results[host.Name] = checkSSHConnectionAdvanced(host, workDir)
-        }
-        return results
+    if len(hosts) == 0 {
+        return results, nil
     }
 
-    // Для большего количества хостов - параллельно
+    // Дедупликация по Name: первое вхождение побеждает, остальные пропускаются.
+    seen := make(map[string]bool, len(hosts))
+    uniqueHosts := make([]HostConfig, 0, len(hosts))
+    var skipped []string
+    for _, host := range hosts {
+        if seen[host.Name] {
+            debugLog("CHECKER", "Skipping duplicate host name %q (first occurrence wins)", host.Name)
+            skipped = append(skipped, host.Name)
+            continue
+        }
+        seen[host.Name] = true
+        uniqueHosts = append(uniqueHosts, host)
+    }
+
     resultChan := make(chan struct {
         name   string
         result bool
-    }, len(hosts))
+    }, len(uniqueHosts))
 
-    // Максимум 3 параллельных проверки, чтобы не перегружать сеть
-    semaphore := make(chan struct{}, 3)
+    // 6 параллельных проверок под 16+ хостов (по анкете 5-8)
+    semaphore := make(chan struct{}, 6)
 
-    for _, host := range hosts {
+    for _, host := range uniqueHosts {
         go func(h HostConfig) {
             semaphore <- struct{}{}
             defer func() { <-semaphore }()
@@ -203,12 +236,12 @@ func checkSSHConnectionBatch(hosts []HostConfig, workDir string) map[string]bool
     }
 
     // Собираем результаты
-    for i := 0; i < len(hosts); i++ {
+    for i := 0; i < len(uniqueHosts); i++ {
         res := <-resultChan
         results[res.name] = res.result
     }
 
-    return results
+    return results, skipped
 }
 
 // findFastestAvailableHost находит самый быстрый доступный хост из списка
@@ -225,7 +258,7 @@ func findFastestAvailableHost(hosts []HostConfig, workDir string) (*HostConfig, 
     }
 
     results := make(chan hostResult, len(hosts))
-    semaphore := make(chan struct{}, 3) // Максимум 3 параллельных проверки
+    semaphore := make(chan struct{}, 6) // 6 параллельных проверок под 16+ хостов
 
     for _, host := range hosts {
         go func(h HostConfig) {
@@ -255,6 +288,10 @@ func findFastestAvailableHost(hosts []HostConfig, workDir string) (*HostConfig, 
         }
     }
 
+    if fastestHost == nil {
+        return nil, 0
+    }
+
     return fastestHost, fastestTime
 }
 
@@ -272,7 +309,7 @@ func checkHostsAvailabilityWithTime(hosts []HostConfig, workDir string) map[stri
     }
 
     results := make(chan hostCheckResult, len(hosts))
-    semaphore := make(chan struct{}, 3) // Максимум 3 параллельных проверки
+    semaphore := make(chan struct{}, 6) // 6 параллельных проверок под 16+ хостов
 
     for _, host := range hosts {
         go func(h HostConfig) {

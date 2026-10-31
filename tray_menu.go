@@ -32,6 +32,58 @@ var (
         chainSectionBottomSep *systray.MenuItem
 )
 
+// Render cache — skip systray calls when nothing changed.
+// updateMenuState() бежал каждую секунду и дёргал SetTitle/Show/Enable у всех
+// пунктов — открытое меню мерцало («полосочка»). Теперь применяем только diff.
+var (
+        menuRenderCache   = make(map[string]string)
+        menuRenderCacheMu sync.Mutex
+)
+
+// renderMenuItem применяет состояние пункта меню только если оно изменилось.
+func renderMenuItem(key, title, tooltip string, checked, enabled, visible bool, item *systray.MenuItem) {
+        if item == nil {
+                return
+        }
+        sig := fmt.Sprintf("%s\x00%s\x00%v%v%v", title, tooltip, checked, enabled, visible)
+        menuRenderCacheMu.Lock()
+        if old, ok := menuRenderCache[key]; ok && old == sig {
+                menuRenderCacheMu.Unlock()
+                return
+        }
+        menuRenderCache[key] = sig
+        menuRenderCacheMu.Unlock()
+
+        if title != "" {
+                item.SetTitle(title)
+        }
+        if tooltip != "" {
+                item.SetTooltip(tooltip)
+        }
+        if checked {
+                item.Check()
+        } else {
+                item.Uncheck()
+        }
+        if enabled {
+                item.Enable()
+        } else {
+                item.Disable()
+        }
+        if visible {
+                item.Show()
+        } else {
+                item.Hide()
+        }
+}
+
+// invalidateMenuCache сбрасывает кэш (смена хоста/состояния).
+func invalidateMenuCache() {
+        menuRenderCacheMu.Lock()
+        menuRenderCache = make(map[string]string)
+        menuRenderCacheMu.Unlock()
+}
+
 // Chain builder state — ordered list of hosts selected by user for chain building
 var (
         chainBuilder         []HostConfig // Ordered list: index = chain position
@@ -589,7 +641,7 @@ func updateHostStatusInMenu(hosts []HostConfig, initialCheck bool) {
         }
 
         // Check effective hosts
-        sshStatusCache := checkSSHConnectionBatch(effectiveHosts, Config.Paths.WorkDir)
+        sshStatusCache, _ := checkSSHConnectionBatch(effectiveHosts, Config.Paths.WorkDir)
 
         debugLog("MENU", "SSH status check results: %v", sshStatusCache)
 
@@ -700,6 +752,7 @@ func updateMenuState() {
                 debugLog("MENU", "updateMenuState: active=%v, host=%q", isActive, currentHostVal)
                 lastMenuState.active = isActive
                 lastMenuState.host = currentHostVal
+                invalidateMenuCache()
         }
 
         isChain := false
@@ -741,25 +794,27 @@ func updateMenuState() {
                         if item == nil {
                                 continue
                         }
+                        key := fmt.Sprintf("chain:%d", i)
                         if i < len(displayChainParts) {
                                 hostName := displayChainParts[i]
                                 paddedName := padRight(hostName, chainMaxLength)
 
-                                item.Check()
-                                item.Enable()
                                 startedTime := connState.GetStartTime()
                                 if !startedTime.IsZero() {
                                         duration := time.Since(startedTime)
                                         durationStr := formatDuration(duration)
-                                        item.SetTitle(fmt.Sprintf("%s (%s)", paddedName, durationStr))
-                                        item.SetTooltip(fmt.Sprintf("Connected: %s\nDuration: %s", currentHostVal, durationStr))
+                                        renderMenuItem(key,
+                                                fmt.Sprintf("%s (%s)", paddedName, durationStr),
+                                                fmt.Sprintf("Connected: %s\nDuration: %s", currentHostVal, durationStr),
+                                                true, true, true, item)
                                 } else {
-                                        item.SetTitle(fmt.Sprintf("%s", paddedName))
-                                        item.SetTooltip(fmt.Sprintf("Connected: %s", currentHostVal))
+                                        renderMenuItem(key,
+                                                paddedName,
+                                                fmt.Sprintf("Connected: %s", currentHostVal),
+                                                true, true, true, item)
                                 }
-                                item.Show()
                         } else {
-                                item.Hide()
+                                renderMenuItem(key, "", "", false, true, false, item)
                         }
                 }
         } else {
@@ -769,7 +824,7 @@ func updateMenuState() {
                 }
                 for i := 0; i < maxChainDisplay; i++ {
                         if chainSectionItems[i] != nil {
-                                chainSectionItems[i].Hide()
+                                renderMenuItem(fmt.Sprintf("chain:%d", i), "", "", false, true, false, chainSectionItems[i])
                         }
                 }
         }
@@ -793,34 +848,33 @@ func updateMenuState() {
 
                 paddedName := padRight(hostName, maxLength)
 
+                key := "host:" + hostName
+
                 // If chain is active, hide chain hosts from main menu
                 if isChain && chainHostSet[hostName] {
-                        menuItem.Hide()
+                        renderMenuItem(key, "", "", false, true, false, menuItem)
                         continue
                 }
 
-                // Make sure item is visible
-                menuItem.Show()
-
                 if !isChain && connState.IsActive() && hostName == currentHostVal {
                         // Single host connection
-                        menuItem.Check()
                         startedTime := connState.GetStartTime()
                         if !startedTime.IsZero() {
                                 duration := time.Since(startedTime)
                                 durationStr := formatDuration(duration)
-                                menuItem.SetTitle(fmt.Sprintf("%s %s (%s)", CurrentArrow, padRight(hostName, maxLength), durationStr))
-                                menuItem.SetTooltip(fmt.Sprintf("Currently connected to %s for %s", hostName, durationStr))
+                                renderMenuItem(key,
+                                        fmt.Sprintf("%s %s (%s)", CurrentArrow, padRight(hostName, maxLength), durationStr),
+                                        fmt.Sprintf("Currently connected to %s for %s", hostName, durationStr),
+                                        true, true, true, menuItem)
                         } else {
-                                menuItem.SetTitle(fmt.Sprintf("%s %s", CurrentArrow, padRight(hostName, maxLength)))
-                                menuItem.SetTooltip(fmt.Sprintf("Currently connected to %s", hostName))
+                                renderMenuItem(key,
+                                        fmt.Sprintf("%s %s", CurrentArrow, padRight(hostName, maxLength)),
+                                        fmt.Sprintf("Currently connected to %s", hostName),
+                                        true, true, true, menuItem)
                         }
-                        menuItem.Enable()
                 } else if pos, inChain := chainBuilderPos[hostName]; inChain {
                         // Host is in chain builder — show with [N] number
                         posStr := fmt.Sprintf("[%d]", pos)
-                        menuItem.Uncheck()
-                        menuItem.SetTitle(fmt.Sprintf("%s %s", posStr, paddedName))
 
                         // Build tooltip showing chain order
                         var chainNames []string
@@ -828,51 +882,42 @@ func updateMenuState() {
                                 chainNames = append(chainNames, fmt.Sprintf("[%d] %s", i+1, ch.Name))
                         }
                         chainDisplay := strings.Join(chainNames, " -> ")
-                        menuItem.SetTooltip(fmt.Sprintf("Chain: %s", chainDisplay))
-                        menuItem.Enable()
+                        renderMenuItem(key,
+                                fmt.Sprintf("%s %s", posStr, paddedName),
+                                fmt.Sprintf("Chain: %s", chainDisplay),
+                                false, true, true, menuItem)
                 } else {
                         // Not active host and not in chain
-                        menuItem.Uncheck()
-
                         // Restore status from cache if available
                         if status, exists := hostStatusCache.Get(hostName); exists {
                                 var statusIcon, tooltip string
 
-                                if isReverseHostByName(hostName) {
-                                        if status {
-                                                statusIcon = GreenCircle
-                                                tooltip = fmt.Sprintf("%s: SSH connection available", hostName)
-                                                menuItem.Enable()
-                                        } else {
-                                                statusIcon = RedCircle
-                                                tooltip = fmt.Sprintf("%s: SSH connection failed", hostName)
-                                                menuItem.Disable()
-                                        }
+                                if status {
+                                        statusIcon = GreenCircle
+                                        tooltip = fmt.Sprintf("%s: SSH connection available", hostName)
                                 } else {
-                                        if status {
-                                                statusIcon = GreenCircle
-                                                tooltip = fmt.Sprintf("%s: SSH connection available", hostName)
-                                                menuItem.Enable()
-                                        } else {
-                                                statusIcon = RedCircle
-                                                tooltip = fmt.Sprintf("%s: SSH connection failed", hostName)
-                                                menuItem.Disable()
-                                        }
+                                        statusIcon = RedCircle
+                                        tooltip = fmt.Sprintf("%s: SSH connection failed", hostName)
                                 }
 
-                                menuItem.SetTitle(fmt.Sprintf("%s %s", statusIcon, paddedName))
-                                menuItem.SetTooltip(tooltip)
+                                renderMenuItem(key,
+                                        fmt.Sprintf("%s %s", statusIcon, paddedName),
+                                        tooltip,
+                                        false, status, true, menuItem)
                         }
                 }
         }
 }
 
-// menuUpdateLoop periodically updates the menu (only UI, not monitoring)
+// menuUpdateLoop periodically updates the menu (only UI, not monitoring).
+// Тик 15с: длительность рисуется с точностью до минуты, а все события
+// (коннект/фейловер/статусы) пушат updateMenuState() напрямую.
+// Вместе с render-кэшем это убирает мерцание открытого меню.
 func menuUpdateLoop() {
         if menuUpdateTicker != nil {
                 menuUpdateTicker.Stop()
         }
-        menuUpdateTicker = time.NewTicker(1 * time.Second)
+        menuUpdateTicker = time.NewTicker(15 * time.Second)
 
         for range menuUpdateTicker.C {
                 // Update menu if tunnel is active (to update duration)

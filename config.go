@@ -48,13 +48,14 @@ type AppConfig struct {
 
 	// Network settings
 	Network struct {
-		ProxyPort             int `ini:"ProxyPort"`
-		PACHttpPort           int `ini:"PACHttpPort"`
-		SocksCheckInterval    int `ini:"SocksCheckInterval"`    // SOCKS5 check interval in seconds
-		InternetCheckDelay    int `ini:"InternetCheckDelay"`    // Delay before internet check in seconds
-		InternetCheckRetry    int `ini:"InternetCheckRetry"`    // Internet check retry interval in seconds
-		ReconnectAttemptDelay int `ini:"ReconnectAttemptDelay"` // Reconnect attempt interval in seconds
-		MaxReconnectTime      int `ini:"MaxReconnectTime"`      // Max reconnection time in seconds
+		ProxyPort             int    `ini:"ProxyPort"`
+		PACHttpPort           int    `ini:"PACHttpPort"`
+		SocksCheckInterval    int    `ini:"SocksCheckInterval"`    // SOCKS5 check interval in seconds
+		InternetCheckDelay    int    `ini:"InternetCheckDelay"`    // Delay before internet check in seconds
+		InternetCheckRetry    int    `ini:"InternetCheckRetry"`    // Internet check retry interval in seconds
+		ReconnectAttemptDelay int    `ini:"ReconnectAttemptDelay"` // Reconnect attempt interval in seconds
+		MaxReconnectTime      int    `ini:"MaxReconnectTime"`      // Max reconnection time in seconds (0 = infinite)
+		InternetCheckURLs     string `ini:"InternetCheckURLs"`     // Comma-separated check URLs (optional, defaults kept)
 	}
 
 	// Path settings
@@ -214,6 +215,9 @@ func SaveConfig(cfgPath string) error {
 	sec.NewKey("InternetCheckRetry", strconv.Itoa(Config.Network.InternetCheckRetry))
 	sec.NewKey("ReconnectAttemptDelay", strconv.Itoa(Config.Network.ReconnectAttemptDelay))
 	sec.NewKey("MaxReconnectTime", strconv.Itoa(Config.Network.MaxReconnectTime))
+	if Config.Network.InternetCheckURLs != "" {
+		sec.NewKey("InternetCheckURLs", Config.Network.InternetCheckURLs)
+	}
 
 	// --- Paths section ---
 	sec = cfg.Section("Paths")
@@ -257,6 +261,7 @@ func setDefaultConfig() {
 	Config.Network.InternetCheckRetry = 10    // Retry internet check every 10 seconds (changed from 5)
 	Config.Network.ReconnectAttemptDelay = 20 // Reconnect attempt every 20 seconds (changed from 10)
 	Config.Network.MaxReconnectTime = 7200    // Max reconnection time 2 hours (7200 seconds) (changed from 3600)
+	Config.Network.InternetCheckURLs = "https://clients1.google.com/generate_204,http://connectivitycheck.gstatic.com/generate_204"
 
 	// Path settings - relative paths in Windows style
 	Config.Paths.WorkDir = "." // Current execution directory

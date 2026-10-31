@@ -66,6 +66,37 @@ func debugLog(module, format string, args ...interface{}) {
         }
         f.WriteString(line)
         f.Close()
+
+        // Ротация по размеру (по анкете): 5МБ, держать 5 файлов.
+        rotateDebugLog(logPath)
+}
+
+// rotateDebugLog rotates x_goproxy_debug.log -> .1 .. .5 when > 5MB.
+func rotateDebugLog(logPath string) {
+        const maxSize = 5 << 20
+        st, err := os.Stat(logPath)
+        if err != nil || st.Size() < maxSize {
+                return
+        }
+        // Удаляем самый старый, сдвигаем остальные
+        oldest := logPath + ".5"
+        _ = os.Remove(oldest)
+        for i := 4; i >= 1; i-- {
+                src := logPath
+                if i > 1 {
+                        src = logPath + "." + itoa(i-1)
+                } else {
+                        src = logPath
+                }
+                dst := logPath + "." + itoa(i)
+                if _, err := os.Stat(src); err == nil {
+                        _ = os.Rename(src, dst)
+                }
+        }
+}
+
+func itoa(i int) string {
+        return fmt.Sprintf("%d", i)
 }
 
 // writeCrashLog writes a panic report with full stack trace.

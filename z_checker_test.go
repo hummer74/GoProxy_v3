@@ -21,12 +21,26 @@ func TestCheckProxyConnectivityOnPort_NothingListening(t *testing.T) {
 }
 
 func TestCheckProxyConnectivityOnPort_ActualListener(t *testing.T) {
-	// Start a TCP listener on a random port
+	// Fake SOCKS5 server: отвечает 0x05 0x00 на greeting.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skip("Cannot create test listener")
 	}
 	defer listener.Close()
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, 3)
+				_, _ = conn.Read(buf)
+				_, _ = conn.Write([]byte{0x05, 0x00})
+			}(c)
+		}
+	}()
 
 	addr := listener.Addr().(*net.TCPAddr)
 	result := checkProxyConnectivityOnPort(addr.Port)
