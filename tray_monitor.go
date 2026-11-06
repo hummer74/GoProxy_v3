@@ -1367,7 +1367,7 @@ func tryAutoConnectLastHost() {
 				// Find fastest available host
 				var availableHosts []HostConfig
 				for _, h := range hosts {
-					if h.Group == hosts[0].Group && !strings.Contains(h.Name, "Rev-") && h.ProxyJump == "" {
+					if h.Group == hosts[0].Group && !isReverseHost(h) && h.ProxyJump == "" {
 						availableHosts = append(availableHosts, h)
 					}
 				}
@@ -1443,7 +1443,7 @@ func tryAutoConnectLastHost() {
 			// Find fastest available host
 			var availableHosts []HostConfig
 			for _, h := range hosts {
-				if h.Group == hosts[0].Group && h.Name != priorityHostName && !strings.Contains(h.Name, "Rev-") && h.ProxyJump == "" {
+				if h.Group == hosts[0].Group && h.Name != priorityHostName && !isReverseHost(h) && h.ProxyJump == "" {
 					availableHosts = append(availableHosts, h)
 				}
 			}

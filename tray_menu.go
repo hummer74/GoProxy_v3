@@ -168,11 +168,17 @@ func isReverseHost(h HostConfig) bool {
 	return h.ProxyJump != ""
 }
 
-// isReverseJumperHost returns true if the host belongs to the REVERSE JUMPER group.
+// isReverseJumperHost returns true if some other host uses h as its ProxyJump target.
 // These hosts are used only for building reverse chains (ProxyJump targets)
 // and must never be used as failover candidates.
+// Structural (rename-proof): no name/group convention is assumed.
 func isReverseJumperHost(h HostConfig) bool {
-	return strings.Contains(h.Group, "REVERSE JUMPER")
+	for _, o := range allMenuHosts {
+		if o.Name != h.Name && o.ProxyJump == h.Name {
+			return true
+		}
+	}
+	return false
 }
 
 // getGlobalMaxLength returns the maximum host name length across all menu hosts.

@@ -251,13 +251,24 @@ func TestIsReverseHost(t *testing.T) {
 }
 
 func TestIsReverseJumperHost(t *testing.T) {
+	// Structural semantics: a host is a jumper iff another host references it via ProxyJump.
+	oldHosts := allMenuHosts
+	defer func() { allMenuHosts = oldHosts }()
+	allMenuHosts = []HostConfig{
+		{Name: "jumper-a"},
+		{Name: "jumper-b", ProxyJump: "jumper-b"}, // self-reference is not a jumper link
+		{Name: "rev-1", ProxyJump: "jumper-a"},
+		{Name: "normal"},
+	}
 	tests := []struct {
 		host HostConfig
 		want bool
 	}{
-		{HostConfig{Name: "normal", Group: "GROUP1"}, false},
-		{HostConfig{Name: "jumper", Group: "REVERSE JUMPER"}, true},
-		{HostConfig{Name: "partial", Group: "REVERSE JUMPER GROUP2"}, true},
+		{HostConfig{Name: "normal"}, false},
+		{HostConfig{Name: "jumper-a"}, true},
+		{HostConfig{Name: "jumper-b"}, false},
+		{HostConfig{Name: "rev-1"}, false},
+		{HostConfig{Name: "ghost-not-in-list"}, false},
 	}
 	for _, tt := range tests {
 		got := isReverseJumperHost(tt.host)
