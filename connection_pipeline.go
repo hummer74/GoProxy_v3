@@ -8,9 +8,14 @@ package main
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// establishMu serializes whole connection attempts: no two tunnels are
+// built/killed concurrently (fast double clicks, monitor + user racing).
+var establishMu sync.Mutex
 
 // ConnectOptions parametrizes a connection attempt.
 type ConnectOptions struct {
@@ -37,6 +42,11 @@ type ConnectOptions struct {
 	// Override SSH command.  Auto-built from Hosts if empty.
 	SSHCommand []string
 
+	// Preflight — prove the new tunnel on a test port BEFORE killing
+	// the live one. On failure the old tunnel (and its monitoring)
+	// stay untouched and nil is returned with gen 0.
+	Preflight bool
+
 	// Display names for tray/logging (auto-derived if empty).
 	DisplayAlias   string // e.g. "myserver" or "Chain"
 	DisplayTooltip string // e.g. "user@host.com"
@@ -58,9 +68,23 @@ type ConnectOptions struct {
 // this connection from inside its own tick MUST adopt the gen — otherwise
 // its next tick sees a mismatch and exits, leaving the tunnel unmonitored.
 func establishConnection(opts ConnectOptions) (*ProxyState, uint64) {
+	// Serialize whole attempts — no parallel tunnel build/kill races.
+	establishMu.Lock()
+	defer establishMu.Unlock()
+
 	// Clear the user-stop flag: any new connection attempt (user click,
 	// failover, recovery) cancels a previous "Stop Proxy" request.
 	atomic.StoreUint64(&userStopRequested, 0)
+
+	// Pre-flight: prove the new tunnel on a test port BEFORE invalidating
+	// anything. On failure the live tunnel and its monitoring survive
+	// untouched (gen 0 — the caller must not adopt anything).
+	if opts.Preflight {
+		if !preflightNewTunnel(opts) {
+			showTrayConnectionFailed()
+			return nil, 0
+		}
+	}
 
 	// Invalidate any previous connection attempts (cancel zombie retry loops)
 	// Единая точка: отменяет старый мониторинг/retry через connMgr.
@@ -204,6 +228,37 @@ func establishConnection(opts ConnectOptions) (*ProxyState, uint64) {
 	}
 
 	return finishConnection(state, alias, tooltip, opts), gen
+}
+
+// preflightNewTunnel builds the SSH command and proves a full SOCKS5 tunnel
+// on a temporary port. It never touches the live tunnel, PID files or the
+// monitoring generation — safe to run before the handover.
+func preflightNewTunnel(opts ConnectOptions) bool {
+	if len(opts.Hosts) == 0 {
+		return false
+	}
+	sshKeyPath := opts.SSHKeyPath
+	if sshKeyPath == "" {
+		sshKeyPath = resolveSSHKeyPath(Config.Paths.WorkDir, opts.Hosts[0].IdentityFile)
+	}
+	if !ensureSSHAgent(sshKeyPath, loadSSHKeyPassphrase()) {
+		logTunnelEvent("ERROR", opts.Hosts[0].Name, "Pre-flight: SSH-Agent failed — aborting")
+		return false
+	}
+	sshCmd := opts.SSHCommand
+	if len(sshCmd) == 0 {
+		sshCmd = buildSSHCommand(opts.Hosts, sshKeyPath)
+	}
+	testPort := Config.Network.ProxyPort + preflightPortUserChain
+	timeout := preflightTimeout(len(opts.Hosts))
+	logTunnelEvent("INFO", opts.Hosts[0].Name,
+		fmt.Sprintf("Pre-flight tunnel test on port %d (live tunnel stays up)...", testPort))
+	if !testTunnelConnectivity(sshCmd, testPort, timeout) {
+		logTunnelEvent("WARN", opts.Hosts[0].Name, "Pre-flight test FAILED — keeping live tunnel")
+		return false
+	}
+	logTunnelEvent("OK", opts.Hosts[0].Name, "Pre-flight test PASSED")
+	return true
 }
 
 // finishConnection handles post-tunnel steps: PAC, proxy, state, tray, monitoring.

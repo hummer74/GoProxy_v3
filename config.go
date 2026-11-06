@@ -16,9 +16,9 @@ var Config *AppConfig
 
 // Global variables for logging mode
 var (
-	isTrayMode     bool // Running in tray mode
-	priorityHost   string // Priority host from x_lasthost.cfg
-	hasPriorityHost bool  // Whether priority host was loaded
+	isTrayMode      bool   // Running in tray mode
+	priorityHost    string // Priority host from x_lasthost.cfg
+	hasPriorityHost bool   // Whether priority host was loaded
 )
 
 // GetPriorityHost returns the current priority host name

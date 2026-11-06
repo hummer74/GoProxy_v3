@@ -21,9 +21,14 @@ func handleHostClick(host HostConfig) {
 		return
 	}
 
-	// Check if host is available before attempting connection
+	// Check if host is available before attempting connection.
+	// Single connect to a host without direct access stays banned —
+	// explain instead of staying silent.
 	if status, exists := hostStatusCache.Get(host.Name); exists && !status {
 		logTunnelEvent("WARN", host.Name, "Attempted to connect to unavailable host")
+		flashTrayHint(fmt.Sprintf("%s %s — no direct access", ChainOnlyMarker, host.Name),
+			fmt.Sprintf("%s is unreachable directly. Add it to the chain builder after a reachable host.", host.Name),
+			4*time.Second)
 		return
 	}
 
@@ -77,9 +82,13 @@ func handleReverseHostClick(host HostConfig) {
 		return
 	}
 
-	// Check availability (reverse hosts check via their ProxyJump target)
+	// Check availability (reverse hosts check via their ProxyJump target).
+	// Unavailable reverse hosts cannot be used — explain instead of staying silent.
 	if status, exists := hostStatusCache.Get(host.Name); exists && !status {
 		logTunnelEvent("WARN", host.Name, "Attempted to connect to unavailable reverse host")
+		flashTrayHint(fmt.Sprintf("%s %s — no direct access", ChainOnlyMarker, host.Name),
+			fmt.Sprintf("%s is unreachable (its entry point is down).", host.Name),
+			4*time.Second)
 		return
 	}
 
@@ -306,6 +315,38 @@ func handleConnectChain() {
 		return
 	}
 
+	// Structural gate first — the builder stays intact on refusal,
+	// so the user can fix the first hop instead of re-adding everything.
+	if _, err := classifyChain(chain); err != nil {
+		logTunnelEvent("WARN", chainDisplayOf(chain), fmt.Sprintf("Chain refused: %s", err.Error()))
+		flashTrayHint("Chain blocked — bad first hop",
+			err.Error()+".",
+			5*time.Second)
+		updateChainBuilderUI()
+		return
+	}
+
+	if len(chain) == 1 {
+		// Single host — use direct connection (it re-checks availability).
+		clearChainBuilder()
+		updateChainBuilderUI()
+		handleHostClick(chain[0])
+		return
+	}
+
+	// Hard gate: fresh ssh-level probe of the first hop BEFORE touching
+	// the live tunnel. Cache may be stale; only ssh.exe knows the truth.
+	updateTrayStatusReconnecting("Chain", "Probing first hop...")
+	if !firstHopProbeFn(chain[0]) {
+		logTunnelEvent("ERROR", chainDisplayOf(chain),
+			fmt.Sprintf("First hop %q is unreachable — chain not started, live tunnel untouched", chain[0].Name))
+		flashTrayHint(fmt.Sprintf("First hop %s unreachable", chain[0].Name),
+			fmt.Sprintf("%s does not answer ssh right now. Chain not started.", chain[0].Name),
+			5*time.Second)
+		updateChainBuilderUI()
+		return
+	}
+
 	// Snapshot and clear immediately to prevent TOCTOU:
 	// another click could modify the builder while we're connecting.
 	clearChainBuilder()
@@ -320,29 +361,27 @@ func handleConnectChain() {
 
 	logTunnelEvent("INFO", chainDisplay, fmt.Sprintf("User requested chain connection: %s", chainDisplay))
 
-	if len(chain) == 1 {
-		// Single host — use direct connection
-		handleHostClick(chain[0])
-	} else {
-		// Multiple hosts — use chain connection via pipeline
-		result, _ := establishConnection(ConnectOptions{
-			Hosts:              chain,
-			IsChain:            true,
-			OriginalHost:       chainDisplay,
-			StopMonitoring:     true,
-			KillExistingTunnel: true,
-			EnableSystemProxy:  true,
-			SaveLastHost:       true,
-			StartMonitoring:    true,
-			UpdateTray:         true,
-			DisplayAlias:       "Chain",
-			DisplayTooltip:     chainDisplay,
-		})
+	// At this point len(chain) > 1 (singletons returned earlier).
+	// Multiple hosts — use chain connection via pipeline with pre-flight:
+	// the new chain is proven on a test port BEFORE the live tunnel dies.
+	result, _ := establishConnection(ConnectOptions{
+		Hosts:              chain,
+		IsChain:            true,
+		OriginalHost:       chainDisplay,
+		StopMonitoring:     true,
+		KillExistingTunnel: true,
+		EnableSystemProxy:  true,
+		SaveLastHost:       true,
+		StartMonitoring:    true,
+		UpdateTray:         true,
+		DisplayAlias:       "Chain",
+		DisplayTooltip:     chainDisplay,
+		Preflight:          true,
+	})
 
-		if result == nil {
-			logTunnelEvent("ERROR", chainDisplay, "Chain connection failed")
-			updateTrayStatusReconnecting("Chain", chainDisplay)
-		}
+	if result == nil {
+		logTunnelEvent("ERROR", chainDisplay, "Chain connection failed")
+		updateTrayStatusReconnecting("Chain", chainDisplay)
 	}
 }
 
@@ -388,8 +427,9 @@ func handleKillProxy() {
 	if iconData != nil {
 		systray.SetIcon(iconData)
 	}
-	systray.SetTitle("SOCKS5: Ready")
-	systray.SetTooltip("Ready to connect. Select a host.")
+	// StoppedByUser: calm yellow, distinct from errors (red) and ready-idle.
+	systray.SetTitle("SOCKS5: Stopped")
+	systray.SetTooltip("Stopped by user — select a host to start.")
 
 	connState.SetDisconnected()
 	connState.SetFailState(StateNormal)

@@ -54,6 +54,12 @@ type monitoringConfig struct {
 	networkAvailable     bool
 	reconnectAttempts    int
 
+	// SOCKS debounce: consecutive failures (failover at SocksFailThreshold).
+	socksFails int
+
+	// Failover loop start (give up after MaxFailoverDuration).
+	failoverStart time.Time
+
 	// Failover / recovery state
 	originalChainState *ProxyState // saved when entering Failover (for chain recovery)
 	failoverAttempts   int         // how many hosts we've tried in current Failover cycle
@@ -404,11 +410,18 @@ func (mc *monitoringConfig) handleNormalState(state *ProxyState) {
 	mc.lastSocksCheck = time.Now()
 
 	if !checkProxyConnectivityFunc() {
-		// ── Tunnel went offline ──
-		logTunnelEvent("ERROR", state.Host, "Tunnel lost connection (SOCKS5 not responding)")
-		mc.enterFailoverState(state)
+		// ── Tunnel may be offline — debounce consecutive failures ──
+		if mc.recordSocks(false) {
+			logTunnelEvent("ERROR", state.Host,
+				fmt.Sprintf("Tunnel lost connection (SOCKS5 not responding %dx) — failing over", SocksFailThreshold))
+			mc.enterFailoverState(state)
+		} else {
+			logTunnelEvent("WARN", state.Host,
+				fmt.Sprintf("SOCKS5 check failed (%d/%d) — waiting, tunnel may flap", mc.socksFails, SocksFailThreshold))
+		}
 		return
 	}
+	mc.recordSocks(true)
 
 	// ── 2. Periodic chain host monitoring (advisory only) ──
 	// Detects degradation early, but NEVER fails over a working tunnel:
@@ -504,6 +517,8 @@ func (mc *monitoringConfig) enterFailoverState(state *ProxyState) {
 	stateCopy := *state
 	mc.originalChainState = &stateCopy
 	mc.failoverAttempts = 0
+	mc.socksFails = 0
+	mc.failoverStart = time.Now()
 
 	// Transition to Failover
 	mc.failState = StateFailover
@@ -513,6 +528,84 @@ func (mc *monitoringConfig) enterFailoverState(state *ProxyState) {
 	debugLog("MONITOR", "Entering Failover state from Normal (original host: %s)", state.Host)
 	updateTrayStatusReconnecting(aliasForState(state), remoteForState(state))
 	updateMenuState()
+}
+
+// refailoverSameChain tries to rebuild the failed chain as-is: the entry hop
+// must answer ssh directly (first-hop rule), the rest is proven end-to-end
+// by a pre-flight tunnel test. Via-only members are NOT checked directly —
+// that would block recovery forever.
+// Returns (rebuilt, gen); a non-zero gen must be adopted by the caller even
+// when rebuild failed, because establishConnection moved the generation.
+func (mc *monitoringConfig) refailoverSameChain(state *ProxyState) (bool, uint64) {
+	orig := mc.originalChainState
+	if orig == nil || !orig.IsChain || len(orig.ChainHosts) == 0 {
+		return false, 0
+	}
+	hosts := parseSSHConfig(Config.Paths.SSHConfig)
+	hostMap := make(map[string]HostConfig, len(hosts))
+	for _, h := range hosts {
+		hostMap[h.Name] = h
+	}
+	var chain []HostConfig
+	for _, name := range orig.ChainHosts {
+		h, ok := hostMap[name]
+		if !ok {
+			debugLog("MONITOR", "Refailover: host %q not found in SSH config", name)
+			return false, 0
+		}
+		chain = append(chain, h)
+	}
+	// Entry hop must be directly reachable.
+	if ok, _ := checkSSHConnectionWithTime(chain[0], Config.Paths.WorkDir); !ok {
+		debugLog("MONITOR", "Refailover: entry host %s unreachable, skipping", chain[0].Name)
+		return false, 0
+	}
+	sshKeyPath := resolveSSHKeyPath(Config.Paths.WorkDir, chain[0].IdentityFile)
+	if !ensureSSHAgent(sshKeyPath, loadSSHKeyPassphrase()) {
+		debugLog("MONITOR", "Refailover: SSH-Agent failed")
+		return false, 0
+	}
+	var chainNames []string
+	for _, h := range chain {
+		chainNames = append(chainNames, h.Name)
+	}
+	chainDisplay := strings.Join(chainNames, " -> ")
+	testSSHCmd := buildSSHCommand(chain, sshKeyPath)
+	testPort := Config.Network.ProxyPort + preflightPortChainRefail
+	logTunnelEvent("INFO", chainDisplay,
+		fmt.Sprintf("Refailover: pre-flight same-chain test on port %d...", testPort))
+	if !testTunnelConnectivity(testSSHCmd, testPort, preflightTimeout(len(chain))) {
+		debugLog("MONITOR", "Refailover: pre-flight FAILED for %s", chainDisplay)
+		return false, 0
+	}
+	logTunnelEvent("INFO", chainDisplay, "Refailover: pre-flight PASSED — rebuilding same chain")
+	result, gen := establishConnection(ConnectOptions{
+		Hosts:              chain,
+		IsChain:            true,
+		OriginalHost:       orig.OriginalHost,
+		IsFailoverActive:   true,
+		FailoverStart:      time.Now().Format(time.RFC3339),
+		StopMonitoring:     false, // don't stop ourselves
+		KillExistingTunnel: true,
+		EnableSystemProxy:  true,
+		SaveLastHost:       false,
+		StartMonitoring:    false, // don't start new monitoring
+		UpdateTray:         true,
+		DisplayAlias:       "Chain",
+		DisplayTooltip:     chainDisplay,
+	})
+	if result == nil {
+		logTunnelEvent("WARN", chainDisplay, "Refailover: rebuild failed, falling back to single host")
+		return false, gen
+	}
+	logTunnelEvent("OK", chainDisplay, "Refailover: same chain rebuilt")
+	updateTrayStatusFailover("Chain", chainDisplay)
+	updateMenuState()
+	mc.failState = StateRecovery
+	connState.SetFailState(StateRecovery)
+	mc.lastOrigHostCheck = time.Time{} // check original restore immediately
+	mc.failoverAttempts = 0
+	return true, gen
 }
 
 // handleFailoverState finds the fastest available host and connects to it.
@@ -532,6 +625,27 @@ func (mc *monitoringConfig) handleFailoverState(state *ProxyState) uint64 {
 	if !Config.General.SmartFailover {
 		mc.enterErrorHalt(state, "SmartFailover disabled by config — automatic host switching off")
 		return 0
+	}
+
+	// Give up an endless loop: minutes of total failure → ErrorHalt/NoInternet
+	// (which shows red), instead of yellow reconnecting forever.
+	if failoverExpired(mc.failoverStart, time.Now()) {
+		mc.enterErrorHalt(state, fmt.Sprintf("failover gave up after %v without reachable host", MaxFailoverDuration))
+		return 0
+	}
+
+	// Same-chain re-establish first: if we fell off a chain, try to rebuild
+	// the SAME chain (entry-direct + end-to-end preflight) before dropping
+	// to a single host.
+	if mc.originalChainState != nil && mc.originalChainState.IsChain && len(mc.originalChainState.ChainHosts) > 0 {
+		if ok, gen := mc.refailoverSameChain(state); ok {
+			debugLog("MONITOR", "Same-chain refailover succeeded, adopting gen %d", gen)
+			return gen
+		} else if gen != 0 {
+			// Preflight/connection moved the generation — adopt it.
+			return gen
+		}
+		// Chain not rebuildable right now — fall through to single-host failover.
 	}
 
 	// ── 1. Gather available hosts (all groups, exclude current and reverse) ──
@@ -692,21 +806,26 @@ func (mc *monitoringConfig) handleFailoverState(state *ProxyState) uint64 {
 // Returns the generation of a new session (0 = none created); the caller
 // MUST adopt a non-zero gen for the same reason as in handleFailoverState.
 func (mc *monitoringConfig) handleRecoveryState(state *ProxyState) uint64 {
-	// ── 1. Check failover host (SOCKS5) ──
+	// ── 1. Check failover host (SOCKS5, debounced) ──
 	if time.Since(mc.lastSocksCheck) >= mc.socksCheckInterval {
 		mc.lastSocksCheck = time.Now()
 
 		if !checkProxyConnectivityFunc() {
-			// Failover host itself dropped — return to Failover state
-			logTunnelEvent("ERROR", state.Host, "Failover host lost connection, returning to Failover state")
-			mc.failState = StateFailover
-			connState.SetFailState(StateFailover)
-			connState.SetActive(false)
-			mc.failoverAttempts = 0
-			updateTrayStatusReconnecting(aliasForState(state), remoteForState(state))
-			updateMenuState()
+			if mc.recordSocks(false) {
+				// Failover host itself dropped — return to Failover state
+				logTunnelEvent("ERROR", state.Host, "Failover host lost connection, returning to Failover state")
+				mc.failState = StateFailover
+				connState.SetFailState(StateFailover)
+				connState.SetActive(false)
+				mc.failoverAttempts = 0
+				updateTrayStatusReconnecting(aliasForState(state), remoteForState(state))
+				updateMenuState()
+			} else {
+				debugLog("MONITOR", "Recovery: SOCKS flap (%d/%d), waiting", mc.socksFails, SocksFailThreshold)
+			}
 			return 0
 		}
+		mc.recordSocks(true)
 	}
 
 	// ── 2. Periodically check if original chain can be restored ──
@@ -728,31 +847,45 @@ func (mc *monitoringConfig) handleRecoveryState(state *ProxyState) uint64 {
 	origState := mc.originalChainState
 
 	if origState.IsChain && len(origState.ChainHosts) > 0 {
-		// ── Chain recovery: check ALL hosts in the original chain ──
-		allOk, failedHosts := checkChainHostsReachable(origState.ChainHosts)
-
-		if allOk {
-			logTunnelEvent("INFO", state.Host,
-				"All original chain hosts are reachable, attempting chain restoration")
-			ok, newGen := attemptChainRecovery(origState)
-			if ok {
-				// Chain restored — transition to Normal
-				mc.failState = StateNormal
-				connState.SetFailState(StateNormal)
-				connState.SetActive(true)
-				mc.originalChainState = nil // clear saved state
-
-				logTunnelEvent("OK", origState.Host, "Original chain restored — returning to Normal state")
-				updateMenuState()
-				return newGen
+		// ── Chain recovery: only the ENTRY hop must answer directly
+		// (first-hop rule). Via-only members are deliberately NOT checked
+		// directly — the pre-flight inside attemptChainRecovery proves
+		// the whole chain end-to-end.
+		entryName := origState.ChainHosts[0]
+		hosts := parseSSHConfig(Config.Paths.SSHConfig)
+		var entryConfig *HostConfig
+		for i := range hosts {
+			if hosts[i].Name == entryName {
+				entryConfig = &hosts[i]
+				break
 			}
-			// Chain restoration failed — stay in Recovery, will retry next cycle.
-			// Still adopt: a failed establishConnection moved our generation.
-			if newGen != 0 {
-				return newGen
-			}
-		} else {
-			debugLog("MONITOR", "Recovery: chain hosts still unavailable: %v", failedHosts)
+		}
+		if entryConfig == nil {
+			debugLog("MONITOR", "Recovery: entry host %q not found in SSH config", entryName)
+			return 0
+		}
+		if ok, _ := checkSSHConnectionWithTime(*entryConfig, Config.Paths.WorkDir); !ok {
+			debugLog("MONITOR", "Recovery: entry host %s unreachable, skipping restore", entryName)
+			return 0
+		}
+		logTunnelEvent("INFO", state.Host,
+			fmt.Sprintf("Entry host %s is reachable, attempting chain restoration", entryName))
+		ok, newGen := attemptChainRecovery(origState)
+		if ok {
+			// Chain restored — transition to Normal
+			mc.failState = StateNormal
+			connState.SetFailState(StateNormal)
+			connState.SetActive(true)
+			mc.originalChainState = nil // clear saved state
+
+			logTunnelEvent("OK", origState.Host, "Original chain restored — returning to Normal state")
+			updateMenuState()
+			return newGen
+		}
+		// Failed after pre-flight passed — stay in Recovery, but adopt:
+		// the session was created, our generation moved.
+		if newGen != 0 {
+			return newGen
 		}
 	} else {
 		// ── Single host recovery: check original host ──
@@ -897,7 +1030,13 @@ func (mc *monitoringConfig) handleNoInternetState(state *ProxyState) {
 
 	alias := aliasForState(state)
 	remote := remoteForState(state)
-	updateTrayStatusNoInternet(alias, remote, elapsed, mc.noInternetMax)
+	if noInternetShouldBeRed(mc.noInternetStart, time.Now()) {
+		updateTrayStatusNoInternet(alias, remote, elapsed, mc.noInternetMax)
+	} else {
+		// Grace period: yellow "waiting", red only when the outage persists.
+		updateTrayStatusWaiting(alias, remote,
+			fmt.Sprintf("Waiting for internet (%dm)...", int(elapsed.Minutes())+1))
+	}
 
 	if !checkInternetDirect() {
 		debugLog("MONITOR", "NoInternet: still no connectivity")
@@ -963,7 +1102,8 @@ func (mc *monitoringConfig) enterErrorHalt(state *ProxyState, reason string) {
 
 	alias := aliasForState(state)
 	remote := remoteForState(state)
-	updateTrayStatusNoInternet(alias, remote, 0, mc.noInternetMax)
+	// Start yellow ("waiting") — red comes after the grace period.
+	updateTrayStatusWaiting(alias, remote, "Waiting for internet...")
 	updateMenuState()
 }
 

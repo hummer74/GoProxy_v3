@@ -3,9 +3,9 @@
 // unwanted reconnection when user clicks "Stop Proxy".
 //
 // We test the flag mechanics directly (no Windows, no SSH, no tray):
-//   1. Setting the flag causes the monitoring loop to exit
-//   2. establishConnection resets the flag
-//   3. The flag survives even when monitoringStopChan is contended
+//  1. Setting the flag causes the monitoring loop to exit
+//  2. establishConnection resets the flag
+//  3. The flag survives even when monitoringStopChan is contended
 //
 // We don't call startMonitoring() directly (it needs real channels, Config,
 // systray etc.), but we reproduce the exact loop logic to verify the flag check.

@@ -50,7 +50,7 @@ func TestAddKeyToAgentCleansUpAskPass(t *testing.T) {
 	// Override paths to use tmpDir.
 	Config.Paths.WorkDir = tmpDir
 	Config.Paths.SSHKey = filepath.Join(tmpDir, "id_key") // not used but set.
-	resolvePaths() // adjust absolute paths.
+	resolvePaths()                                        // adjust absolute paths.
 
 	// Mock checkAndStartSSHAgent to return true (assume agent is running).
 	checkAndStartSSHAgent = func() bool { return true }
