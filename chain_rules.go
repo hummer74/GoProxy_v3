@@ -3,7 +3,7 @@
 // Термины:
 //
 //	direct status — результат ПРЯМОЙ проверки хоста с этой машины (hostStatusCache).
-//	Хосты без прямого доступа помечаются ⛓ и доступны только как 2-й+ хоп цепочки.
+//	Хосты без прямого доступа помечаются ○ и доступны только как 2-й+ хоп цепочки.
 //	Одиночное подключение таких хостов запрещено (клик показывает подсказку).
 package main
 
@@ -13,7 +13,7 @@ import (
 )
 
 // ChainOnlyMarker prefixes menu titles of hosts without direct access.
-const ChainOnlyMarker = "⛓"
+const ChainOnlyMarker = "○"
 
 // SocksFailThreshold — consecutive SOCKS failures before leaving Normal.
 const SocksFailThreshold = 3

@@ -283,7 +283,7 @@ func createTrayMenu() {
 				}
 
 				paddedName := padRight(host.Name, maxLength)
-				menuTitle := fmt.Sprintf("○ %s", paddedName) // Empty circle for checking
+				menuTitle := fmt.Sprintf("… %s", paddedName) // Checking (ellipsis — ○ is taken by chain-only)
 
 				tooltip := fmt.Sprintf("Checking SSH connection to %s...", host.Name)
 				if isReverseHost(host) {
