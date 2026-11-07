@@ -380,8 +380,13 @@ func handleConnectChain() {
 	})
 
 	if result == nil {
-		logTunnelEvent("ERROR", chainDisplay, "Chain connection failed")
-		updateTrayStatusReconnecting("Chain", chainDisplay)
+		if establishWasBusy() {
+			flashTrayHint("Switch in progress…", "Another connection attempt is running — please wait a few seconds and retry", 4*time.Second)
+			logTunnelEvent("WARN", chainDisplay, "Chain connection skipped — another connection attempt in progress")
+		} else {
+			logTunnelEvent("ERROR", chainDisplay, "Chain connection failed")
+			updateTrayStatusReconnecting("Chain", chainDisplay)
+		}
 	}
 }
 
@@ -521,7 +526,7 @@ func attemptTunnelRestart(state *ProxyState) bool {
 		return false
 	}
 
-	savePid(Config.TempFiles.SSHTunnelPID, cmd.Process.Pid, state.Host)
+	savePid(Config.TempFiles.SSHTunnelPID, cmd.Process.Pid, "SSH Tunnel")
 
 	// Wait for tunnel to become available (max 10 seconds) using Ticker
 	const restartTimeout = 10 * time.Second

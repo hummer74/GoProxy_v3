@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,7 +16,16 @@ import (
 
 // establishMu serializes whole connection attempts: no two tunnels are
 // built/killed concurrently (fast double clicks, monitor + user racing).
+// establishBusyFlag is set when an attempt backs off because another one
+// is already in flight (TryLock failed). UI reads it via establishWasBusy.
 var establishMu sync.Mutex
+var establishBusyFlag int64
+
+// establishWasBusy reports whether the last establishConnection call found
+// another one in flight (used for the "please wait" tray hint).
+func establishWasBusy() bool {
+	return atomic.LoadInt64(&establishBusyFlag) != 0
+}
 
 // ConnectOptions parametrizes a connection attempt.
 type ConnectOptions struct {
@@ -69,7 +79,14 @@ type ConnectOptions struct {
 // its next tick sees a mismatch and exits, leaving the tunnel unmonitored.
 func establishConnection(opts ConnectOptions) (*ProxyState, uint64) {
 	// Serialize whole attempts — no parallel tunnel build/kill races.
-	establishMu.Lock()
+	// A racing second attempt backs off immediately instead of queueing
+	// behind a 45s pre-flight (UI shows "please wait" via establishWasBusy).
+	atomic.StoreInt64(&establishBusyFlag, 0)
+	if !establishMu.TryLock() {
+		logTunnelEvent("WARN", chainDisplayOf(opts.Hosts), "Connection attempt skipped: another switch is already in progress")
+		atomic.StoreInt64(&establishBusyFlag, 1)
+		return nil, 0
+	}
 	defer establishMu.Unlock()
 
 	// Clear the user-stop flag: any new connection attempt (user click,
@@ -253,8 +270,12 @@ func preflightNewTunnel(opts ConnectOptions) bool {
 	timeout := preflightTimeout(len(opts.Hosts))
 	logTunnelEvent("INFO", opts.Hosts[0].Name,
 		fmt.Sprintf("Pre-flight tunnel test on port %d (live tunnel stays up)...", testPort))
-	if !testTunnelConnectivity(sshCmd, testPort, timeout) {
-		logTunnelEvent("WARN", opts.Hosts[0].Name, "Pre-flight test FAILED — keeping live tunnel")
+	if ok, freason := probeTunnelWithReason(sshCmd, testPort, timeout); !ok {
+		if freason == "auth" {
+			logTunnelEvent("ERROR", opts.Hosts[0].Name, "Pre-flight FAILED: SSH key rejected — manual fix needed, not retrying")
+		} else {
+			logTunnelEvent("WARN", opts.Hosts[0].Name, "Pre-flight test FAILED — keeping live tunnel")
+		}
 		return false
 	}
 	logTunnelEvent("OK", opts.Hosts[0].Name, "Pre-flight test PASSED")
@@ -264,12 +285,19 @@ func preflightNewTunnel(opts ConnectOptions) bool {
 // finishConnection handles post-tunnel steps: PAC, proxy, state, tray, monitoring.
 func finishConnection(state ProxyState, alias, tooltip string, opts ConnectOptions) *ProxyState {
 	debugLog("PIPELINE", "finishConnection: %s", alias)
-	// PAC + system proxy
+	// PAC + system proxy (only if the PAC server actually bound its port —
+	// pointing the system at a dead PAC kills the user's internet).
+	pacOK := true
 	if opts.EnableSystemProxy {
 		startPACServer()         // generate & write PAC file to disk
 		startPACServerInternal() // start HTTP server to serve the PAC file
-		pacURL := fmt.Sprintf("http://127.0.0.1:%d/x_proxy.pac", Config.Network.PACHttpPort)
-		setSystemProxy(pacURL)
+		if waitForPACServer(Config.Network.PACHttpPort, 3*time.Second) {
+			pacURL := fmt.Sprintf("http://127.0.0.1:%d/x_proxy.pac", Config.Network.PACHttpPort)
+			setSystemProxy(pacURL)
+		} else {
+			pacOK = false
+			logTunnelEvent("ERROR", alias, fmt.Sprintf("PAC server failed to bind :%d (port busy?) — system proxy NOT enabled, tunnel still works", Config.Network.PACHttpPort))
+		}
 	}
 
 	// Global connection state
@@ -283,6 +311,10 @@ func finishConnection(state ProxyState, alias, tooltip string, opts ConnectOptio
 			failoverSuffix = " (Failover)"
 		}
 		updateTrayStatusOnline(alias, tooltip+failoverSuffix)
+		if opts.EnableSystemProxy && !pacOK {
+			flashTrayHint(fmt.Sprintf("PAC :%d busy — proxy NOT set", Config.Network.PACHttpPort),
+				"Another app holds the PAC port. Tunnel works; system proxy left untouched.", 5*time.Second)
+		}
 	}
 
 	// Monitoring
@@ -291,6 +323,20 @@ func finishConnection(state ProxyState, alias, tooltip string, opts ConnectOptio
 	}
 
 	return &state
+}
+
+// waitForPACServer polls until something accepts TCP on the PAC port
+// (our freshly started server) or the timeout expires. Guards against
+// enabling the system proxy toward a dead PAC (bind conflict).
+func waitForPACServer(port int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if tcpPortOpen("127.0.0.1", strconv.Itoa(port), time.Second) {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
 }
 
 // showTrayConnectionFailed resets tray to yellow with "Connection failed".

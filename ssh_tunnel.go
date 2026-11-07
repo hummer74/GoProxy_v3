@@ -3,10 +3,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	windows "golang.org/x/sys/windows"
@@ -28,6 +30,28 @@ import (
 //
 // The caller should call this BEFORE establishConnection to guarantee that
 // killing the old production tunnel is safe.
+// lockedBuffer is a bytes.Buffer safe for concurrent use: os/exec writes
+// the child's stderr from its own copy-goroutine while the monitoring
+// ticker reads it. Plain bytes.Buffer races (go test -race).
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write implements io.Writer.
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// String returns the accumulated output.
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func testTunnelConnectivity(sshCmd []string, testPort int, timeout time.Duration) bool {
 	myGen := connMgr.generation()
 	testCmd := replaceSSHTunnelPort(sshCmd, testPort)
@@ -38,7 +62,7 @@ func testTunnelConnectivity(sshCmd []string, testPort int, timeout time.Duration
 	cmd := exec.Command(testCmd[0], testCmd[1:]...)
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 
-	var stderr bytes.Buffer
+	var stderr lockedBuffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Start(); err != nil {
@@ -112,6 +136,54 @@ func testTunnelConnectivity(sshCmd []string, testPort int, timeout time.Duration
 			}
 		}
 	}
+}
+
+// classifySSHErr maps ssh stderr to a failure class: "auth" (key rejected,
+// manual fix needed) or "net" (transient — retry/failover makes sense).
+func classifySSHErr(stderr string) string {
+	low := strings.ToLower(stderr)
+	for _, s := range []string{
+		"permission denied",
+		"authentication failed",
+		"publickey",
+		"no mutual signature",
+		"bad passphrase",
+		"could not load key",
+		"key_load_public",
+		"identity file",
+		"no such identity",
+	} {
+		if strings.Contains(low, s) {
+			return "auth"
+		}
+	}
+	return "net"
+}
+
+// runSSHQuickProbe runs an ssh command briefly and returns its stderr for
+// classification. Used only on failure paths (after a pre-flight already
+// failed) to tell auth failures apart from network ones.
+func runSSHQuickProbe(sshCmd []string) string {
+	if len(sshCmd) == 0 {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, sshCmd[0], sshCmd[1:]...)
+	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	var stderr lockedBuffer
+	cmd.Stderr = &stderr
+	_ = cmd.Run()
+	return stderr.String()
+}
+
+// probeTunnelWithReason runs a full pre-flight and classifies failures.
+// reason is "auth", "net", or "" when ok.
+func probeTunnelWithReason(sshCmd []string, testPort int, timeout time.Duration) (bool, string) {
+	if testTunnelConnectivity(sshCmd, testPort, timeout) {
+		return true, ""
+	}
+	return false, classifySSHErr(runSSHQuickProbe(sshCmd))
 }
 
 // startSSHTunnel starts the SSH tunnel with default retries (chain length 1)
@@ -271,8 +343,9 @@ func startSSHTunnelWithTimeout(sshCmd []string, timeout time.Duration, gen uint6
 	cmd := exec.Command(sshCmd[0], sshCmd[1:]...)
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 
-	// Capture both stdout and stderr for debugging
-	var stdout, stderr bytes.Buffer
+	// Capture both stdout and stderr for debugging.
+	// Locked: the ticker/timeout branches read while the child still runs.
+	var stdout, stderr lockedBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 

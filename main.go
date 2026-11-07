@@ -250,6 +250,10 @@ func runStartupCleanup() {
 	purgeSSHAgentKeys()
 	// Fail-open: a crash may leave the system pointing at a dead PAC
 	disableSystemProxy()
+	// One-shot stop flag: a leftover from a crashed -stop must not wedge the
+	// next session (its own cleanup already removes it on the happy path).
+	// A fresh process start is a new intent — AutoConnect decides.
+	os.Remove(Config.TempFiles.StopFlag)
 	// Legacy known_hosts from pre-nul versions
 	os.Remove(filepath.Join(Config.Paths.WorkDir, ".ssh", "goproxy_known_hosts"))
 }

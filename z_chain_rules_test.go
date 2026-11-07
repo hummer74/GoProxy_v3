@@ -193,11 +193,27 @@ func TestPreflightTimeout_ScalesWithChain(t *testing.T) {
 // firstHopProbeFn without config
 // ---------------------------------------------------------------------------
 
-func TestFirstHopProbeFn_NilConfig(t *testing.T) {
+func TestFirstHopProbe_NilConfig(t *testing.T) {
 	old := Config
 	Config = nil
 	defer func() { Config = old }()
 	if firstHopProbeFn(HostConfig{Name: "x"}) {
 		t.Error("nil config must probe as unreachable")
+	}
+}
+
+func TestSleepGapExceeded(t *testing.T) {
+	now := time.Now()
+	if sleepGapExceeded(time.Time{}, now) {
+		t.Error("zero last tick must not count as gap")
+	}
+	if sleepGapExceeded(now, now) {
+		t.Error("fresh tick must not count as gap")
+	}
+	if !sleepGapExceeded(now.Add(-time.Minute), now) {
+		t.Error("60s gap must count as sleep/wake")
+	}
+	if sleepGapExceeded(now.Add(-10*time.Second), now) {
+		t.Error("10s gap must not count as sleep/wake")
 	}
 }

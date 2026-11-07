@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,17 +43,31 @@ func setSystemProxy(pacURL string) bool {
 	return true
 }
 
-// disableSystemProxy clears PAC and disables proxy in Windows Internet Settings
+// disableSystemProxy clears OUR PAC and disables the proxy in Windows Internet
+// Settings. A foreign AutoConfigURL (corporate proxy, another tool) is left
+// untouched — blanking it would break the user's network.
 func disableSystemProxy() {
 	debugLog("PROXY", "Disabling system proxy")
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, windows.KEY_SET_VALUE)
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, windows.KEY_QUERY_VALUE|windows.KEY_SET_VALUE)
 	if err != nil {
 		return
 	}
 	defer k.Close()
 
+	if cur, _, err := k.GetStringValue("AutoConfigURL"); err == nil && cur != "" && !isOurPAC(cur) {
+		logTunnelEvent("WARN", "proxy", fmt.Sprintf("Leaving foreign AutoConfigURL in place: %s", cur))
+		return
+	}
 	_ = k.SetStringValue("AutoConfigURL", "")
 	_ = k.SetDWordValue("ProxyEnable", 0)
+}
+
+// isOurPAC reports whether a PAC URL is ours (x_proxy.pac served on our port).
+func isOurPAC(url string) bool {
+	if !strings.Contains(url, "x_proxy.pac") {
+		return false
+	}
+	return strings.Contains(url, strconv.Itoa(Config.Network.PACHttpPort))
 }
 
 // stopPACServer gracefully shuts down the PAC HTTP server with a 3-second timeout.

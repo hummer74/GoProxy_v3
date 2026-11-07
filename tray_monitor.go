@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"image/color"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -59,6 +60,17 @@ type monitoringConfig struct {
 
 	// Failover loop start (give up after MaxFailoverDuration).
 	failoverStart time.Time
+
+	// ErrorHalt retry: the halt may resolve on its own (transient outage).
+	errorHaltRetry bool
+	errorHaltStart time.Time
+
+	// Uplink probe state (end-to-end traffic check through the tunnel).
+	lastUplinkCheck time.Time
+	uplinkFails     int
+
+	// Last monitor tick (sleep/wake gap detection).
+	lastTick time.Time
 
 	// Failover / recovery state
 	originalChainState *ProxyState // saved when entering Failover (for chain recovery)
@@ -361,9 +373,14 @@ func attemptChainRecovery(originalState *ProxyState) (bool, uint64) {
 		chainTestTimeout = 15 * time.Second
 	}
 
-	if !testTunnelConnectivity(testSSHCmd, testPort, chainTestTimeout) {
-		logTunnelEvent("WARN", chainDisplay,
-			"Pre-flight chain test FAILED — failover tunnel preserved, will retry later")
+	if ok, freason := probeTunnelWithReason(testSSHCmd, testPort, chainTestTimeout); !ok {
+		if freason == "auth" {
+			logTunnelEvent("ERROR", chainDisplay,
+				"Pre-flight chain test FAILED: SSH key rejected — fix the key, failover tunnel stays up")
+		} else {
+			logTunnelEvent("WARN", chainDisplay,
+				"Pre-flight chain test FAILED — failover tunnel preserved, will retry later")
+		}
 		return false, 0
 	}
 
@@ -422,6 +439,24 @@ func (mc *monitoringConfig) handleNormalState(state *ProxyState) {
 		return
 	}
 	mc.recordSocks(true)
+
+	// ── 1b. Uplink check: SOCKS handshake succeeds even with a dead uplink
+	// (local ssh.exe keeps listening) — prove real traffic flows through.
+	// N consecutive end-to-end failures = tunnel loss, same as SOCKS loss.
+	if time.Since(mc.lastUplinkCheck) >= UplinkCheckInterval {
+		mc.lastUplinkCheck = time.Now()
+		if checkUplinkFunc() {
+			mc.recordUplink(true)
+		} else if mc.recordUplink(false) {
+			logTunnelEvent("ERROR", state.Host,
+				fmt.Sprintf("No traffic through tunnel (%dx) — uplink dead, failing over", UplinkFailThreshold))
+			mc.enterFailoverState(state)
+			return
+		} else {
+			logTunnelEvent("WARN", state.Host,
+				fmt.Sprintf("Uplink probe failed (%d/%d) — waiting, tunnel may flap", mc.uplinkFails, UplinkFailThreshold))
+		}
+	}
 
 	// ── 2. Periodic chain host monitoring (advisory only) ──
 	// Detects degradation early, but NEVER fails over a working tunnel:
@@ -574,7 +609,12 @@ func (mc *monitoringConfig) refailoverSameChain(state *ProxyState) (bool, uint64
 	testPort := Config.Network.ProxyPort + preflightPortChainRefail
 	logTunnelEvent("INFO", chainDisplay,
 		fmt.Sprintf("Refailover: pre-flight same-chain test on port %d...", testPort))
-	if !testTunnelConnectivity(testSSHCmd, testPort, preflightTimeout(len(chain))) {
+	if ok, freason := probeTunnelWithReason(testSSHCmd, testPort, preflightTimeout(len(chain))); !ok {
+		if freason == "auth" {
+			logTunnelEvent("ERROR", chainDisplay, "Refailover: SSH key rejected — manual fix needed")
+			mc.enterErrorHalt(state, "SSH key rejected by "+chain[0].Name, false)
+			return false, 0
+		}
 		debugLog("MONITOR", "Refailover: pre-flight FAILED for %s", chainDisplay)
 		return false, 0
 	}
@@ -623,14 +663,14 @@ func (mc *monitoringConfig) handleFailoverState(state *ProxyState) uint64 {
 	// конфигом — честно уходим в ErrorHalt/NoInternet вместо тихого игнора
 	// флага. Дефолт ini (true) поведение не меняет.
 	if !Config.General.SmartFailover {
-		mc.enterErrorHalt(state, "SmartFailover disabled by config — automatic host switching off")
+		mc.enterErrorHalt(state, "SmartFailover disabled by config — automatic host switching off", false)
 		return 0
 	}
 
 	// Give up an endless loop: minutes of total failure → ErrorHalt/NoInternet
 	// (which shows red), instead of yellow reconnecting forever.
 	if failoverExpired(mc.failoverStart, time.Now()) {
-		mc.enterErrorHalt(state, fmt.Sprintf("failover gave up after %v without reachable host", MaxFailoverDuration))
+		mc.enterErrorHalt(state, fmt.Sprintf("failover gave up after %v without reachable host", MaxFailoverDuration), true)
 		return 0
 	}
 
@@ -651,7 +691,7 @@ func (mc *monitoringConfig) handleFailoverState(state *ProxyState) uint64 {
 	// ── 1. Gather available hosts (all groups, exclude current and reverse) ──
 	hosts := parseSSHConfig(Config.Paths.SSHConfig)
 	if len(hosts) == 0 {
-		mc.enterErrorHalt(state, "No hosts found in SSH config")
+		mc.enterErrorHalt(state, "No hosts found in SSH config", false)
 		return 0
 	}
 
@@ -678,7 +718,7 @@ func (mc *monitoringConfig) handleFailoverState(state *ProxyState) uint64 {
 
 	if len(availableHosts) == 0 {
 		logTunnelEvent("ERROR", state.Host, "No alternative hosts available for failover")
-		mc.enterErrorHalt(state, "No alternative hosts available")
+		mc.enterErrorHalt(state, "No alternative hosts available", true)
 		return 0
 	}
 
@@ -742,7 +782,12 @@ func (mc *monitoringConfig) handleFailoverState(state *ProxyState) uint64 {
 	logTunnelEvent("INFO", fastestHost.Name,
 		fmt.Sprintf("Pre-flight tunnel test on port %d...", testPort))
 
-	if !testTunnelConnectivity(testSSHCmd, testPort, 20*time.Second) {
+	if ok, freason := probeTunnelWithReason(testSSHCmd, testPort, 20*time.Second); !ok {
+		if freason == "auth" {
+			logTunnelEvent("ERROR", fastestHost.Name, "Pre-flight FAILED: SSH key rejected — manual fix needed")
+			mc.enterErrorHalt(state, "SSH key rejected by "+fastestHost.Name, false)
+			return 0
+		}
 		mc.failoverAttempts++
 		backoff := failoverBackoff(mc.failoverAttempts)
 		logTunnelEvent("WARN", fastestHost.Name,
@@ -927,9 +972,14 @@ func (mc *monitoringConfig) handleRecoveryState(state *ProxyState) uint64 {
 			logTunnelEvent("INFO", origName,
 				fmt.Sprintf("Pre-flight restore test on port %d (failover tunnel stays alive)...", testPort))
 
-			if !testTunnelConnectivity(testSSHCmd, testPort, 20*time.Second) {
-				logTunnelEvent("WARN", origName,
-					"Pre-flight restore test FAILED — failover tunnel preserved, will retry later")
+			if ok, freason := probeTunnelWithReason(testSSHCmd, testPort, 20*time.Second); !ok {
+				if freason == "auth" {
+					logTunnelEvent("ERROR", origName,
+						"Pre-flight restore test FAILED: SSH key rejected — fix the key, failover tunnel stays up")
+				} else {
+					logTunnelEvent("WARN", origName,
+						"Pre-flight restore test FAILED — failover tunnel preserved, will retry later")
+				}
 				return 0
 			}
 
@@ -990,6 +1040,20 @@ func (mc *monitoringConfig) handleFatalErrorState(state *ProxyState) {
 		logTunnelEvent("OK", state.Host, "Tunnel recovered from Error/Halt state")
 		updateTrayStatusOnline(aliasForState(state), remoteForState(state))
 		updateMenuState()
+		return
+	}
+
+	// Retryable halt (transient outage, not a manual stop): periodically
+	// attempt recovery instead of wedging red forever.
+	if mc.errorHaltRetry && time.Since(mc.errorHaltStart) > ErrorHaltRetryAfter {
+		logTunnelEvent("INFO", state.Host, "Error/Halt retry: attempting recovery")
+		mc.failState = StateFailover
+		connState.SetFailState(StateFailover)
+		mc.failoverStart = time.Now()
+		mc.failoverAttempts = 0
+		mc.errorHaltRetry = false
+		updateTrayStatusReconnecting(aliasForState(state), remoteForState(state))
+		updateMenuState()
 	}
 }
 
@@ -1025,8 +1089,13 @@ func (mc *monitoringConfig) handleNoInternetState(state *ProxyState) {
 	}
 	mc.lastSocksCheck = time.Now()
 
-	logTunnelEvent("INFO", state.Host,
-		fmt.Sprintf("NoInternet: checking internet (%.0f min elapsed)...", elapsed.Minutes()))
+	// Throttle the per-minute jabber: INFO on 10-minute marks, debug otherwise.
+	if m := int(elapsed.Minutes()); m%10 == 0 {
+		logTunnelEvent("INFO", state.Host,
+			fmt.Sprintf("NoInternet: checking internet (%.0f min elapsed)...", elapsed.Minutes()))
+	} else {
+		debugLog("MONITOR", "NoInternet: checking internet (%.0f min elapsed)...", elapsed.Minutes())
+	}
 
 	alias := aliasForState(state)
 	remote := remoteForState(state)
@@ -1066,7 +1135,11 @@ func (mc *monitoringConfig) handleNoInternetState(state *ProxyState) {
 // enterErrorHalt transitions to Error/Halt or NoInternet depending on connectivity.
 // If internet is available → true ErrorHalt (all hosts really are down).
 // If internet is NOT available → StateNoInternet (wait for network, then auto-restore).
-func (mc *monitoringConfig) enterErrorHalt(state *ProxyState, reason string) {
+// retryable=true means the halt may resolve on its own (transient outage):
+// handleFatalErrorState will periodically retry instead of wedging red forever.
+func (mc *monitoringConfig) enterErrorHalt(state *ProxyState, reason string, retryable bool) {
+	mc.errorHaltRetry = retryable
+	mc.errorHaltStart = time.Now()
 	logTunnelEvent("ERROR", state.Host, fmt.Sprintf("All hosts failed: %s — checking internet...", reason))
 
 	// Immediately disable proxy and kill tunnel — no point keeping them alive
@@ -1107,6 +1180,13 @@ func (mc *monitoringConfig) enterErrorHalt(state *ProxyState, reason string) {
 	updateMenuState()
 }
 
+// isHealthyGenerate204 validates a generate_204-style probe response.
+// Status must be exactly 204 with a (near-)empty body — captive portals
+// answer 200/302 with a login page, which must NOT count as "internet".
+func isHealthyGenerate204(status int, bodyLen int64) bool {
+	return status == http.StatusNoContent && bodyLen >= 0 && bodyLen < 1024
+}
+
 // checkInternetDirect checks internet connectivity without using the proxy.
 // URLs берутся из Config.Network.InternetCheckURLs (по анкете).
 func checkInternetDirect() bool {
@@ -1115,11 +1195,13 @@ func checkInternetDirect() bool {
 	client := &http.Client{Timeout: 5 * time.Second}
 	for _, url := range testURLs {
 		resp, err := client.Get(url)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-				return true
-			}
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		resp.Body.Close()
+		if isHealthyGenerate204(resp.StatusCode, int64(len(body))) {
+			return true
 		}
 	}
 	return false
@@ -1186,6 +1268,17 @@ func startMonitoring(state *ProxyState) {
 			return
 
 		case <-ticker.C:
+			// Sleep/wake or clock jump: a long gap makes all in-flight probes
+			// meaningless — reset debounce and skip this tick, re-verify on next.
+			nowTick := time.Now()
+			if sleepGapExceeded(mc.lastTick, nowTick) {
+				debugLog("MONITOR", "Long tick gap (%v) — possible sleep/wake, resetting debounce", nowTick.Sub(mc.lastTick))
+				mc.socksFails = 0
+				mc.lastTick = nowTick
+				mc.lastSocksCheck = nowTick
+				continue
+			}
+			mc.lastTick = nowTick
 			// Сессия superseded новым соединением/kill — выходим, но громко:
 			// молчаливый выход здесь когда-то хоронил мониторинг после
 			// failover-коннекта изнутри собственного тика (см. adopt ниже).
@@ -1383,6 +1476,10 @@ func tryAutoConnectLastHost() {
 					debugLog("MONITOR", "Fallback: switching to %s", fastestHost.Name)
 					safeGo(func() {
 						time.Sleep(2 * time.Second)
+						if atomic.LoadUint64(&userStopRequested) != 0 {
+							debugLog("MONITOR", "Auto-connect aborted: user stopped, skipping establish")
+							return
+						}
 						establishConnection(ConnectOptions{
 							Hosts:              []HostConfig{*fastestHost},
 							OriginalHost:       priorityHostName,
@@ -1402,6 +1499,10 @@ func tryAutoConnectLastHost() {
 				// Priority chain available, connect to it
 				safeGo(func() {
 					time.Sleep(2 * time.Second)
+					if atomic.LoadUint64(&userStopRequested) != 0 {
+						debugLog("MONITOR", "Auto-connect aborted: user stopped, skipping establish")
+						return
+					}
 					chainDisplay := strings.Join(chainNames, " -> ")
 					establishConnection(ConnectOptions{
 						Hosts:              chain,
@@ -1459,6 +1560,10 @@ func tryAutoConnectLastHost() {
 				debugLog("MONITOR", "Fallback: switching to %s", fastestHost.Name)
 				safeGo(func() {
 					time.Sleep(2 * time.Second)
+					if atomic.LoadUint64(&userStopRequested) != 0 {
+						debugLog("MONITOR", "Auto-connect aborted: user stopped, skipping establish")
+						return
+					}
 					establishConnection(ConnectOptions{
 						Hosts:              []HostConfig{*fastestHost},
 						OriginalHost:       priorityHostName,
@@ -1478,6 +1583,10 @@ func tryAutoConnectLastHost() {
 			// Priority host available, connect to it
 			safeGo(func() {
 				time.Sleep(2 * time.Second)
+				if atomic.LoadUint64(&userStopRequested) != 0 {
+					debugLog("MONITOR", "Auto-connect aborted: user stopped, skipping establish")
+					return
+				}
 				establishConnection(ConnectOptions{
 					Hosts:              []HostConfig{*priorityHostConfig},
 					OriginalHost:       priorityHostName,

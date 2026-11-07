@@ -110,7 +110,12 @@ func onTrayReady() {
 
 	// Start PAC server
 	safeGo(startPACServerInternal)
-	debugLog("TRAY", "PAC server started")
+	if !waitForPACServer(Config.Network.PACHttpPort, 2*time.Second) {
+		systray.SetTooltip("Ready to connect. WARNING: PAC server failed to start (port busy?)")
+		debugLog("TRAY", "PAC server failed to start (port busy?)")
+	} else {
+		debugLog("TRAY", "PAC server started")
+	}
 
 	// Start menu update ticker (only for UI updates)
 	menuUpdateTicker = time.NewTicker(1 * time.Second)

@@ -9,6 +9,15 @@ import (
 	"github.com/getlantern/systray"
 )
 
+// Tray icon semantics (single source of truth):
+//
+//	green  — tunnel is up (Online / Failover / Chain).
+//	yellow — transitional or idle: Connecting, Reconnecting, Waiting
+//	         (NoInternet grace period), Stopped-by-user, Connection failed.
+//	red    — needs attention: persistent NoInternet (after grace),
+//	         ErrorHalt (manual), FATAL.
+//
+// Text (title/tooltip) always carries the reason — color alone never does.
 // updateTrayStatusOnline updates tray with online status
 func updateTrayStatusOnline(remoteAlias, displayHost string) {
 	iconData := loadIconData(color.RGBA{0, 255, 0, 255})

@@ -24,6 +24,13 @@ const MaxFailoverDuration = 5 * time.Minute
 // NoInternetRedAfter — grace period with yellow "waiting" before the red icon.
 const NoInternetRedAfter = 3 * time.Minute
 
+// ErrorHaltRetryAfter — how long a retryable ErrorHalt waits before trying
+// recovery instead of wedging red forever. Manual halts never retry.
+const ErrorHaltRetryAfter = 5 * time.Minute
+
+// UplinkCheckInterval — how often to prove real traffic flows through the tunnel.
+const UplinkCheckInterval = 60 * time.Second
+
 // Preflight test ports (offsets from ProxyPort) — each flow gets its own
 // so parallel probes never steal each other's listeners.
 const (
@@ -168,4 +175,30 @@ func preflightTimeout(chainLen int) time.Duration {
 		d = 45 * time.Second
 	}
 	return d
+}
+
+// sleepGapExceeded reports a monitor tick gap big enough to mean sleep,
+// hibernation or a clock jump: in-flight probes from before the gap are
+// meaningless, so the caller resets debounce and skips one tick.
+func sleepGapExceeded(last, now time.Time) bool {
+	if last.IsZero() {
+		return false
+	}
+	return now.Sub(last) > 30*time.Second
+}
+
+// UplinkFailThreshold.
+const UplinkFailThreshold = 3
+
+// checkUplinkFunc probes end-to-end traffic.
+var checkUplinkFunc = checkInternetViaProxy
+
+// recordUplink feeds one end-to-end probe result into the debounce counter.
+func (mc *monitoringConfig) recordUplink(ok bool) bool {
+	if ok {
+		mc.uplinkFails = 0
+		return false
+	}
+	mc.uplinkFails++
+	return mc.uplinkFails >= UplinkFailThreshold
 }

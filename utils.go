@@ -2,7 +2,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -95,35 +97,46 @@ func checkProcessRunning(pidFile string) bool {
 	return err == nil
 }
 
-// killProcessByFile kills a process by its PID file
-func killProcessByFile(pidFile string, name string) {
-	log.Printf("Attempting to kill process '%s' using PID file: %s", name, pidFile)
+// pidFromFile reads a PID plus its identity tag without killing anything.
+// ok=false when the file is missing, unparsable, or holds an invalid PID.
+func pidFromFile(pidFile string) (pid int, info string, hasInfo bool, ok bool) {
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
+		return 0, "", false, false
+	}
+	var pidData PidData
+	if json.Unmarshal(data, &pidData) == nil && pidData.Pid > 0 {
+		return pidData.Pid, pidData.Info, pidData.Info != "", true
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && n > 0 {
+		return n, "", false, true
+	}
+	return 0, "", false, false
+}
+
+// killProcessByFile kills a process by its PID file.
+// SAFETY: never kills blindly by PID — the PID file may be stale and the
+// PID reused by a foreign process. The expected image comes from the PID
+// file itself (PidData.Info): "SSH Tunnel*" → ssh.exe, everything else
+// (tray, PAC server) → our own executable. Mismatch (or PID 0/4/System) →
+// stale file removed, process left alone.
+func killProcessByFile(pidFile string, name string) {
+	log.Printf("Attempting to kill process '%s' using PID file: %s", name, pidFile)
+	pid, info, hasInfo, ok := pidFromFile(pidFile)
+	if !ok {
+		log.Printf("Warning: Could not determine PID from %s (missing or corrupt file).", pidFile)
 		return
 	}
 
-	var pid int = -1 // Initialize with an invalid PID
-	var pidData PidData
-
-	// Attempt JSON unmarshalling first
-	if json.Unmarshal(data, &pidData) == nil {
-		pid = pidData.Pid
-	} else {
-		// Fallback for old simple PID file format
-		if pidFallback, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
-			pid = pidFallback
-		} else {
-			log.Printf("Warning: Failed to parse PID from %s using fallback method (not JSON): %v", pidFile, err)
-		}
-	}
-
 	// Attempt to kill the process if a valid PID was found
-	if pid != -1 {
-		killPid(pid) // Assuming killPid handles its own error logging internally or we accept silent failure on Kill()
-	} else {
-		log.Printf("Warning: Could not determine PID from %s using either JSON or fallback parsing.", pidFile)
+	if !verifyPidForKill(pid, info, hasInfo) {
+		// Stale PID file pointing at a foreign process:
+		// drop the file, keep hands off the process.
+		os.Remove(pidFile)
+		return
 	}
+	// Attempt to kill the process after verification.
+	killPid(pid)
 
 	// Attempt to remove the PID file and log result
 	if err := os.Remove(pidFile); err != nil {
@@ -133,10 +146,122 @@ func killProcessByFile(pidFile string, name string) {
 	}
 }
 
-// killStaleListeners kills processes LISTENING on the given TCP port,
+// verifyPidForKill decides whether pid may be terminated for the given PID
+// file identity. info is the PidData.Info string ("" when unknown/legacy).
+// Returns false for system PIDs and for image mismatches.
+func verifyPidForKill(pid int, info string, hasInfo bool) bool {
+	if pid <= 4 {
+		log.Printf("Refusing to kill system PID %d (stale PID file?)", pid)
+		return false
+	}
+	var expect string
+	if hasInfo {
+		expect = expectedImageFor(info)
+	} else {
+		// Legacy plain-PID file: only our own kinds of processes ever
+		// wrote these (ssh tunnel, tray). Refuse anything else.
+		img, ok := processImageName(pid)
+		if !ok {
+			return true // process already gone — killPid is a harmless no-op
+		}
+		if !isOwnOrSSH(img) {
+			log.Printf("Refusing to kill PID %d (%s): not ours, stale PID file?", pid, img)
+			return false
+		}
+		return true
+	}
+	if !verifyPidImage(pid, expect) {
+		return false
+	}
+	// ssh.exe needs one more proof: our tunnels always carry "-D".
+	// A foreign ssh (interactive session, other tool) must survive.
+	if strings.EqualFold(expect, "ssh.exe") {
+		if cmdline, ok := processCommandLine(pid); ok && !strings.Contains(cmdline, "-D") {
+			log.Printf("Refusing to kill PID %d: ssh.exe without -D in cmdline", pid)
+			return false
+		}
+	}
+	return true
+}
+
+// expectedImageFor maps a PID file's Info tag to the executable we accept.
+func expectedImageFor(info string) string {
+	if strings.Contains(strings.ToLower(info), "ssh") {
+		return "ssh.exe"
+	}
+	return ownExeName()
+}
+
+// ownExeName returns the lower-cased file name of this executable.
+func ownExeName() string {
+	if exe, err := os.Executable(); err == nil {
+		return strings.ToLower(filepath.Base(exe))
+	}
+	return "goproxy.exe"
+}
+
+// isOwnOrSSH reports whether image is our executable or ssh.exe.
+func isOwnOrSSH(img string) bool {
+	img = strings.ToLower(img)
+	return img == "ssh.exe" || img == ownExeName()
+}
+
+// verifyPidImage checks the running image name matches the expectation.
+// Unknown PID (already exited) returns false — the caller treats that as
+// "nothing to kill".
+func verifyPidImage(pid int, expect string) bool {
+	img, ok := processImageName(pid)
+	if !ok {
+		return false
+	}
+	if !strings.EqualFold(img, expect) {
+		log.Printf("Refusing to kill PID %d: image is %q, expected %q (stale PID file?)", pid, img, expect)
+		return false
+	}
+	return true
+}
+
+// processImageName returns the executable name (e.g. "ssh.exe") of a PID.
+// ok=false when the process does not exist or cannot be queried.
+func processImageName(pid int) (string, bool) {
+	cmd := exec.Command("tasklist", "/FI", "PID eq "+strconv.Itoa(pid), "/FO", "CSV", "/NH")
+	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Split(line, ",")
+		if len(fields) >= 2 && strings.TrimSpace(fields[1]) == `"`+strconv.Itoa(pid)+`"` {
+			return strings.Trim(strings.TrimSpace(fields[0]), `"`), true
+		}
+	}
+	return "", false
+}
+
+// processCommandLine returns the full command line of a PID via CIM.
+// ok=false when it cannot be determined (no rights, no PowerShell, gone).
+func processCommandLine(pid int) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command",
+		"(Get-CimInstance Win32_Process -Filter 'ProcessId="+strconv.Itoa(pid)+"').CommandLine")
+	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(out)), true
+}
+
+// killStaleListeners kills OUR OWNED processes LISTENING on the given TCP port,
 // except our own process. Нужен на случай потерянных PID-файлов
 // (stop без админа, килл трея): сирота ssh.exe держит :1080 и новый
 // туннель биндится вторым — трафик расползается между ними.
+//
+// SAFETY: kills only ssh.exe whose command line contains "-D" (our tunnel
+// shape). A foreign listener (other VPN/proxy/clash) is NEVER touched —
+// only reported. Unverifiable owners are skipped, not killed.
 func killStaleListeners(port int) {
 	want := ":" + strconv.Itoa(port)
 	cmd := exec.Command("netstat", "-ano", "-p", "TCP")
@@ -166,7 +291,20 @@ func killStaleListeners(port int) {
 		if !checkPidAlive(pid) {
 			continue
 		}
-		debugLog("UTILS", "Stale listener on %d: PID %d — killing", port, pid)
+		// Owner check: только наш сирота ssh.exe с "-D" в командной строке.
+		// Чужой слушатель (другой VPN/прокси) — не трогаем, только репортим.
+		img, imgOk := processImageName(pid)
+		if !imgOk || !strings.EqualFold(img, "ssh.exe") {
+			debugLog("UTILS", "Listener on %d: PID %d is %q, not our ssh.exe — leaving alone", port, pid, img)
+			logTunnelEvent("WARN", "startup", fmt.Sprintf("Port %d held by foreign %s (PID %d) — not touching", port, img, pid))
+			continue
+		}
+		if cmdline, cmdOk := processCommandLine(pid); !cmdOk || !strings.Contains(cmdline, "-D") {
+			debugLog("UTILS", "Listener on %d: ssh.exe PID %d without -D in cmdline — leaving alone", port, pid)
+			logTunnelEvent("WARN", "startup", fmt.Sprintf("Port %d held by non-tunnel ssh (PID %d) — not touching", port, pid))
+			continue
+		}
+		debugLog("UTILS", "Stale listener on %d: orphan ssh.exe PID %d — killing", port, pid)
 		logTunnelEvent("WARN", "startup", "Stale tunnel on port "+strconv.Itoa(port)+", killing")
 		killPid(pid)
 	}
