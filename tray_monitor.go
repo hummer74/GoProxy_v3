@@ -1414,14 +1414,18 @@ func checkAndRestoreExistingTunnel() {
 // tryAutoConnectLastHost attempts to auto-connect to the priority host from x_lasthost.cfg
 func tryAutoConnectLastHost() {
 	if !Config.General.AutoConnect {
+		logTunnelEvent("INFO", "auto-connect", "AutoConnect disabled in config, skipping auto-connect")
 		return
 	}
 
 	priorityHostName := LoadPriorityHost()
 	if priorityHostName == "" {
+		logTunnelEvent("WARN", "auto-connect", "No saved host (x_lasthost.cfg empty), skipping auto-connect")
 		return
 	}
 
+	logTunnelEvent("INFO", priorityHostName,
+		fmt.Sprintf("Auto-connect: trying last (%s)", priorityHostName))
 	debugLog("MONITOR", "Auto-connect: priorityHost=%s", priorityHostName)
 
 	// Check if priorityHost is a chain (contains "|")
@@ -1429,6 +1433,7 @@ func tryAutoConnectLastHost() {
 		chainNames := strings.Split(priorityHostName, "|")
 		hosts := parseSSHConfig(Config.Paths.SSHConfig)
 		if len(hosts) == 0 {
+			logTunnelEvent("WARN", priorityHostName, "Auto-connect: SSH config empty, skipping auto-connect")
 			return
 		}
 
@@ -1451,29 +1456,22 @@ func tryAutoConnectLastHost() {
 			logTunnelEvent("WARN", priorityHostName,
 				fmt.Sprintf("Auto-connect: hosts not in SSH config (ghosts): %v — skipping them", ghosts))
 		}
+		if len(chain) == 0 {
+			logTunnelEvent("WARN", priorityHostName,
+				"Auto-connect: no usable hosts left in chain, skipping auto-connect")
+			return
+		}
 
 		if len(chain) > 0 {
 			// Check if first host in chain is available
 			available, _ := checkSSHConnectionWithTime(chain[0], Config.Paths.WorkDir)
 			if !available {
 				debugLog("MONITOR", "Priority chain first host %s unavailable, looking for fallback", chain[0].Name)
-				// Find fastest available host
-				var availableHosts []HostConfig
-				for _, h := range hosts {
-					if h.Group == hosts[0].Group && !isReverseHost(h) && h.ProxyJump == "" {
-						availableHosts = append(availableHosts, h)
-					}
-				}
-				// Exclude REVERSE JUMPER hosts from fallback
-				var filteredHosts []HostConfig
-				for _, h := range availableHosts {
-					if !isReverseJumperHost(h) {
-						filteredHosts = append(filteredHosts, h)
-					}
-				}
+				filteredHosts := autoConnectCandidates(hosts, "")
 				fastestHost, _ := findFastestAvailableHost(filteredHosts, Config.Paths.WorkDir)
 				if fastestHost != nil {
-					debugLog("MONITOR", "Fallback: switching to %s", fastestHost.Name)
+					logTunnelEvent("INFO", fastestHost.Name,
+						fmt.Sprintf("Auto-connect fallback: switching to %s", fastestHost.Name))
 					safeGo(func() {
 						time.Sleep(2 * time.Second)
 						if atomic.LoadUint64(&userStopRequested) != 0 {
@@ -1493,7 +1491,7 @@ func tryAutoConnectLastHost() {
 						})
 					})
 				} else {
-					debugLog("MONITOR", "No available hosts for fallback")
+					logTunnelEvent("WARN", priorityHostName, "Auto-connect: no available hosts for fallback")
 				}
 			} else {
 				// Priority chain available, connect to it
@@ -1504,7 +1502,7 @@ func tryAutoConnectLastHost() {
 						return
 					}
 					chainDisplay := strings.Join(chainNames, " -> ")
-					establishConnection(ConnectOptions{
+					if result, _ := establishConnection(ConnectOptions{
 						Hosts:              chain,
 						IsChain:            true,
 						OriginalHost:       priorityHostName,
@@ -1515,13 +1513,18 @@ func tryAutoConnectLastHost() {
 						UpdateTray:         true,
 						DisplayAlias:       "Chain",
 						DisplayTooltip:     chainDisplay,
-					})
+					}); result == nil {
+						logTunnelEvent("WARN", priorityHostName,
+							"Auto-connect: priority chain failed, trying fastest fallback")
+						autoConnectFallbackEstablish(hosts, "", priorityHostName)
+					}
 				})
 			}
 		}
 	} else {
 		hosts := parseSSHConfig(Config.Paths.SSHConfig)
 		if len(hosts) == 0 {
+			logTunnelEvent("WARN", priorityHostName, "Auto-connect: SSH config empty, skipping auto-connect")
 			return
 		}
 
@@ -1541,23 +1544,11 @@ func tryAutoConnectLastHost() {
 		available, _ := checkSSHConnectionWithTime(*priorityHostConfig, Config.Paths.WorkDir)
 		if !available {
 			debugLog("MONITOR", "Priority host %s unavailable, looking for fallback", priorityHostName)
-			// Find fastest available host
-			var availableHosts []HostConfig
-			for _, h := range hosts {
-				if h.Group == hosts[0].Group && h.Name != priorityHostName && !isReverseHost(h) && h.ProxyJump == "" {
-					availableHosts = append(availableHosts, h)
-				}
-			}
-			// Exclude REVERSE JUMPER hosts from fallback
-			var filteredHosts []HostConfig
-			for _, h := range availableHosts {
-				if !isReverseJumperHost(h) {
-					filteredHosts = append(filteredHosts, h)
-				}
-			}
+			filteredHosts := autoConnectCandidates(hosts, priorityHostName)
 			fastestHost, _ := findFastestAvailableHost(filteredHosts, Config.Paths.WorkDir)
 			if fastestHost != nil {
-				debugLog("MONITOR", "Fallback: switching to %s", fastestHost.Name)
+				logTunnelEvent("INFO", fastestHost.Name,
+					fmt.Sprintf("Auto-connect fallback: switching to %s", fastestHost.Name))
 				safeGo(func() {
 					time.Sleep(2 * time.Second)
 					if atomic.LoadUint64(&userStopRequested) != 0 {
@@ -1577,7 +1568,7 @@ func tryAutoConnectLastHost() {
 					})
 				})
 			} else {
-				debugLog("MONITOR", "No available hosts for fallback")
+				logTunnelEvent("WARN", priorityHostName, "Auto-connect: no available hosts for fallback")
 			}
 		} else {
 			// Priority host available, connect to it
@@ -1587,7 +1578,7 @@ func tryAutoConnectLastHost() {
 					debugLog("MONITOR", "Auto-connect aborted: user stopped, skipping establish")
 					return
 				}
-				establishConnection(ConnectOptions{
+				if result, _ := establishConnection(ConnectOptions{
 					Hosts:              []HostConfig{*priorityHostConfig},
 					OriginalHost:       priorityHostName,
 					KillExistingTunnel: true,
@@ -1595,8 +1586,34 @@ func tryAutoConnectLastHost() {
 					SaveLastHost:       false,
 					StartMonitoring:    true,
 					UpdateTray:         true,
-				})
+				}); result == nil {
+					logTunnelEvent("WARN", priorityHostName,
+						"Auto-connect: priority host failed, trying fastest fallback")
+					autoConnectFallbackEstablish(hosts, priorityHostName, priorityHostName)
+				}
 			})
 		}
 	}
+}
+
+// autoConnectFallbackEstablish picks fastest direct host and connects.
+func autoConnectFallbackEstablish(hosts []HostConfig, exclude, original string) {
+	filteredHosts := autoConnectCandidates(hosts, exclude)
+	fastestHost, _ := findFastestAvailableHost(filteredHosts, Config.Paths.WorkDir)
+	if fastestHost == nil {
+		logTunnelEvent("WARN", original, "Auto-connect: no fallback hosts available")
+		return
+	}
+	logTunnelEvent("INFO", fastestHost.Name, fmt.Sprintf("Auto-connect fallback: %s", fastestHost.Name))
+	establishConnection(ConnectOptions{
+		Hosts:              []HostConfig{*fastestHost},
+		OriginalHost:       original,
+		IsFailoverActive:   true,
+		FailoverStart:      time.Now().Format(time.RFC3339),
+		KillExistingTunnel: true,
+		EnableSystemProxy:  true,
+		SaveLastHost:       false,
+		StartMonitoring:    true,
+		UpdateTray:         true,
+	})
 }

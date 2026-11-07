@@ -202,3 +202,24 @@ func (mc *monitoringConfig) recordUplink(ok bool) bool {
 	mc.uplinkFails++
 	return mc.uplinkFails >= UplinkFailThreshold
 }
+
+// autoConnectCandidates filters direct hosts of the priority group for
+// auto-connect fallback: no reverse, no jumper, no ProxyJump-only hosts.
+// Pure, no network - unit-testable.
+func autoConnectCandidates(hosts []HostConfig, exclude string) []HostConfig {
+	if len(hosts) == 0 {
+		return nil
+	}
+	group := hosts[0].Group
+	var out []HostConfig
+	for _, h := range hosts {
+		if h.Group != group || h.Name == exclude {
+			continue
+		}
+		if isReverseHost(h) || isReverseJumperHost(h) || h.ProxyJump != "" {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
