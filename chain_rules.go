@@ -22,7 +22,9 @@ const SocksFailThreshold = 3
 const MaxFailoverDuration = 5 * time.Minute
 
 // NoInternetRedAfter — grace period with yellow "waiting" before the red icon.
-const NoInternetRedAfter = 3 * time.Minute
+// Short: entry here already means SOCKS dead + full scan found nothing +
+// direct internet check failed, so a long grace only delays the verdict.
+const NoInternetRedAfter = 1 * time.Minute
 
 // ErrorHaltRetryAfter — how long a retryable ErrorHalt waits before trying
 // recovery instead of wedging red forever. Manual halts never retry.

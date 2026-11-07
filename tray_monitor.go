@@ -750,6 +750,13 @@ func (mc *monitoringConfig) handleFailoverState(state *ProxyState) uint64 {
 
 	if fastestHost == nil {
 		mc.failoverAttempts++
+		// No hosts at all: is it us or them? A direct check decides —
+		// dead internet goes to NoInternet wait (red after grace) instead
+		// of an endless yellow scan loop with no verdict in the log.
+		if !checkInternetDirect() {
+			mc.enterErrorHalt(state, fmt.Sprintf("no reachable hosts (attempt %d), direct internet check failed", mc.failoverAttempts), true)
+			return 0
+		}
 		// Бесконечный бэкофф по анкете: не уходим в ErrorHalt, ждём следующий тик.
 		backoff := failoverBackoff(mc.failoverAttempts)
 		logTunnelEvent("WARN", state.Host,
