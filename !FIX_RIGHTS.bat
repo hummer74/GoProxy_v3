@@ -40,7 +40,7 @@ if /I "%answer%"=="s" (goto SET) else if /I "%answer%"=="r" (goto RESET) else (
 setlocal enabledelayedexpansion
 echo.
 echo === Reset + Set ===
-for %%F in (*-*) do (
+for %%F in (*-* *_*) do (
     echo - %%F
     takeown /F "%%F" > nul 2>&1
     icacls "%%F" /reset > nul 2>&1

@@ -213,10 +213,11 @@ func buildSSHConfigForHosts(configPath string, hosts []HostConfig, knownHostsPat
 // Builds a short temporary config containing the global Host * block and only the
 // host entries required for the current connection. All host-specific values are
 // taken from the original SSH config. If the original config does not contain
-// UserKnownHostsFile, the temporary config defaults to "nul" on Windows.
+// UserKnownHostsFile, the temporary config defaults to "/dev/null".
+// (Absolute: a relative "nul" becomes a literal junk file in ssh's CWD.)
 func buildSSHCommand(hosts []HostConfig, keyPath string) []string {
 	sshDir := filepath.Join(Config.Paths.WorkDir, ".ssh")
-	knownHostsPath := "nul"
+	knownHostsPath := "/dev/null"
 	sshConfigPath := filepath.Join(sshDir, "goproxy_ssh_config")
 
 	// Ensure .ssh folder exists

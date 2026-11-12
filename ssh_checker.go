@@ -145,7 +145,7 @@ func buildTestSSHCommand(host HostConfig, workDir string) []string {
 		"-o", "ServerAliveInterval=5", // Проверка активности
 		"-o", "ServerAliveCountMax=2", // Быстро отключаться если нет ответа
 		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=nul",
+		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "LogLevel=ERROR", // Только ошибки
 		"-o", "RequestTTY=no",

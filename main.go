@@ -254,8 +254,10 @@ func runStartupCleanup() {
 	// next session (its own cleanup already removes it on the happy path).
 	// A fresh process start is a new intent — AutoConnect decides.
 	os.Remove(Config.TempFiles.StopFlag)
-	// Legacy known_hosts from pre-nul versions
+	// Legacy known_hosts from pre-nul versions, plus the stray "nul" file
+	// that a relative UserKnownHostsFile=nul used to create in .ssh
 	os.Remove(filepath.Join(Config.Paths.WorkDir, ".ssh", "goproxy_known_hosts"))
+	os.Remove(filepath.Join(Config.Paths.WorkDir, ".ssh", "nul"))
 }
 
 // cleanupFlags removes stale flag files from previous sessions
