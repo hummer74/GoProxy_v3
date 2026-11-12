@@ -114,9 +114,10 @@ setlocal enabledelayedexpansion
 :: Save full path to .ssh directory
 set "SSH_DIR=%cd%"
 
-rem P1: только ключевой материал (geoip/7z/pac не трогаем).
-for %%F in (*_key *_key.pub *_pass *-key *-key.pub *-pass) do (
-    if exist "%%F" (
+rem Маска *-* *_*: всё с дефисом/подчёркиванием (ключи, пассы, их конфиги).
+rem geoip_ru.txt пропускаем: тяжёлый справочник, к ключам отношения не имеет.
+for %%F in (*-* *_*) do (
+    if exist "%%F" if /i not "%%F"=="geoip_ru.txt" (
         echo Processing file: "%%F"
         echo Processing file: "%%F" >> "!LOGFILE!"
         takeown /F "%%F" > nul 2>&1
@@ -151,8 +152,8 @@ echo.
 echo ============================================================
 echo Setting strict file permissions...
 echo ============================================================
-for %%F in (*_key *_key.pub *_pass *-key *-key.pub *-pass) do (
-    if exist "%%F" (
+for %%F in (*-* *_*) do (
+    if exist "%%F" if /i not "%%F"=="geoip_ru.txt" (
         echo Processing: %%F
         takeown /F "%%F" > nul 2>&1
         icacls "%%F" /reset > nul 2>&1
@@ -424,8 +425,8 @@ set "HOST_LIST="
 for /f "usebackq tokens=*" %%h in (`powershell -NoProfile -Command "Select-String -Path 'config' -Pattern '^\s*Host\s+([^\s*]+)' | ForEach-Object { $_.Matches.Groups[1].Value }"`) do (
     set "HOST_LIST=1"
     echo    Adding key to host: %%h
-    rem -o IdentitiesOnly=no: разрешаем ключи агента, даже если конфиг их ограничивает
-    type "%NEW_USER%_key.pub" | ssh -F config -o StrictHostKeyChecking=no -o IdentitiesOnly=no %%h "cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+    rem Идемпотентно: есть точная строка - пропускаем, нет - дописываем (без дублей).
+    type "%NEW_USER%_key.pub" | ssh -F config -o StrictHostKeyChecking=no -o IdentitiesOnly=no %%h "mkdir -p ~/.ssh && grep -qFxf - ~/.ssh/authorized_keys 2>/dev/null || cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
     if errorlevel 1 (
         echo    WARNING: Failed to add key to %%h.
         echo    host %%h FAIL >> "!LOGFILE!"
